@@ -7,6 +7,7 @@ This document provides a developer-level deep dive into the orchestration mechan
 Rustic AI's orchestration revolves around a few key concepts:
 
 *   **Guild**: The primary container and orchestration unit. It manages a collection of Agents, their lifecycle, and the resources they share (like messaging and state).
+*   **Guild Manager Agent**: A special system agent that acts as the supervisor for the Guild. It handles bootstrapping, dynamic agent launching, and state monitoring.
 *   **Agent**: The fundamental unit of work. Agents are reactive components that process messages. They are defined by an `AgentSpec`.
 *   **Execution Engine**: The runtime environment that actually "runs" the agents. It abstracts away the concurrency model (e.g., synchronous, threaded, multi-process).
 *   **Messaging**: The communication backbone. Agents communicate exclusively via messages.
@@ -23,6 +24,14 @@ classDiagram
         +messaging: MessagingConfig
         +register_agent()
         +launch_agent()
+    }
+
+    class GuildManagerAgent {
+        +guild_spec: GuildSpec
+        +state_manager: StateManager
+        +launch_guild_agents()
+        +launch_agent()
+        +stop_guild()
     }
 
     class ExecutionEngine {
@@ -48,6 +57,8 @@ classDiagram
     }
 
     Guild --> ExecutionEngine : uses
+    Guild --> GuildManagerAgent : hosts (as system agent)
+    GuildManagerAgent ..> Guild : controls
     ExecutionEngine <|-- SyncExecutionEngine
     Guild o-- AgentSpec : contains
     ExecutionEngine ..> Agent : instantiates & runs
@@ -58,8 +69,9 @@ classDiagram
 The orchestration process follows a clear pipeline:
 1.  **Definition**: You define your Guild and Agents using the Domain Specific Language (DSL) objects (`GuildSpec`, `AgentSpec`) or Builders (`GuildBuilder`, `AgentBuilder`).
 2.  **Construction**: A `Guild` instance is created from the `GuildSpec`.
-3.  **Instantiation**: The `Guild` initializes its `ExecutionEngine` and `Messaging` system.
-4.  **Execution**: Agents are "launched" into the `ExecutionEngine`, which wraps them in an `AgentWrapper` and starts their processing loop.
+3.  **Bootstrapping**: The `Guild` initializes its `ExecutionEngine` and `Messaging` system. Crucially, it launches the `GuildManagerAgent`.
+4.  **Orchestration**: The `GuildManagerAgent` takes over, reading the guild configuration and instructing the `Guild` to launch the remaining application agents.
+5.  **Execution**: Agents are "launched" into the `ExecutionEngine`, which wraps them in an `AgentWrapper` and starts their processing loop.
 
 ### Sequence Diagram: Instantiation
 
@@ -69,22 +81,32 @@ sequenceDiagram
     participant GuildBuilder
     participant Guild
     participant ExecutionEngine
+    participant GuildManagerAgent
     participant AgentWrapper
     participant Agent
 
     User->>GuildBuilder: build_spec()
     GuildBuilder->>User: GuildSpec
-    User->>Guild: __init__(GuildSpec)
+    User->>GuildBuilder: bootstrap()
+    GuildBuilder->>Guild: __init__(GuildSpec)
     Guild->>ExecutionEngine: create_execution_engine()
+    GuildBuilder->>Guild: launch_agent(GuildManagerAgent)
+    Guild->>ExecutionEngine: run_agent(GuildManagerAgent)
+    ExecutionEngine->>GuildManagerAgent: run()
 
-    User->>Guild: launch_agent(AgentSpec)
-    Guild->>ExecutionEngine: run_agent(AgentSpec)
-    ExecutionEngine->>AgentWrapper: __init__(AgentSpec)
-    ExecutionEngine->>AgentWrapper: run()
-    AgentWrapper->>AgentWrapper: initialize_agent()
-    AgentWrapper->>Agent: build_agent_from_spec()
-    AgentWrapper->>AgentWrapper: subscribe_agent_with_messaging()
-    AgentWrapper->>Agent: _notify_ready()
+    Note over GuildManagerAgent: Self-Ready Notification
+
+    GuildManagerAgent->>GuildManagerAgent: launch_guild_agents()
+    loop For each Agent in GuildSpec
+        GuildManagerAgent->>Guild: launch_agent(AgentSpec)
+        Guild->>ExecutionEngine: run_agent(AgentSpec)
+        ExecutionEngine->>AgentWrapper: __init__(AgentSpec)
+        ExecutionEngine->>AgentWrapper: run()
+        AgentWrapper->>AgentWrapper: initialize_agent()
+        AgentWrapper->>Agent: build_agent_from_spec()
+        AgentWrapper->>AgentWrapper: subscribe_agent_with_messaging()
+        AgentWrapper->>Agent: _notify_ready()
+    end
 ```
 
 ## 3. Detailed Mechanism
@@ -109,11 +131,18 @@ agent_spec = (
 )
 ```
 
-### 3.2 Guild Instantiation
+### 3.2 Guild Bootstrapping & The Guild Manager
 
-When a `Guild` is instantiated (often via `GuildHelper.shallow_guild_from_spec`), it initializes:
-1.  **Messaging Config**: Loads the configuration for the message bus (e.g., In-Memory, Redis).
-2.  **Execution Engine**: Instantiates the configured `ExecutionEngine` class (e.g., `SyncExecutionEngine`).
+When a `Guild` is bootstrapped (via `GuildBuilder.bootstrap`), it doesn't immediately launch all user agents. Instead, it launches a **GuildManagerAgent**.
+
+*   **Role**: The `GuildManagerAgent` is the "supervisor" of the guild.
+*   **Responsibilities**:
+    *   **Metastore Sync**: It syncs the `GuildSpec` and `AgentSpec`s to the persistent metastore (database).
+    *   **State Management**: It initializes the `StateManager` to track agent health and status.
+    *   **Agent Launching**: It iterates through the `GuildSpec.agents` and calls `self.guild.launch_agent()` for each one.
+    *   **Monitoring**: It processes `Heartbeat` messages from agents to maintain the guild's health status.
+
+**Key File**: `core/src/rustic_ai/core/agents/system/guild_manager_agent.py`
 
 ### 3.3 Agent Execution
 
