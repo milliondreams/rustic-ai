@@ -653,6 +653,28 @@ class GuildBuilder:
 
         return GuildSpec(**spec_dict)
 
+    def validate_deployable(self) -> GuildSpec:
+        """
+        Build the GuildSpec and strictly validate that every agent's class (and
+        the classes of nested typed props) is importable in the current environment.
+
+        Agent-spec deserialization is tolerant by default: an agent whose package is
+        not installed degrades to an opaque props container rather than raising, so
+        that isolated environments can load a spec without importing agent classes
+        they do not run. This helper opts into fail-fast validation and is intended
+        for environments that are expected to have every agent package installed
+        (e.g. CI or authoring tooling). The ``require_agent_class`` context flows to
+        every nested AgentSpec (and to a GuildManagerAgent's embedded guild_spec).
+
+        Returns:
+            GuildSpec: The validated, deployable GuildSpec instance.
+
+        Raises:
+            pydantic.ValidationError: If any agent's class is not importable.
+        """
+        guild_spec = self.build_spec()
+        return GuildSpec.model_validate(guild_spec.model_dump(), context={"require_agent_class": True})
+
     @classmethod
     def from_spec(cls, guild_spec: GuildSpec) -> "GuildBuilder":
         """
