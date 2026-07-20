@@ -34,7 +34,7 @@ optional = true
 pytest = "^9.1.1"
 black = { version = "^26.5.1", extras = ["jupyter"] }
 flake8 = "^7.3.0"
-tox = "^4.24.1"
+tox = "^4.57.1"
 isort = "^6.0.0"
 mypy = "^1.15.0"
 
