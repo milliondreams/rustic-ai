@@ -125,7 +125,6 @@ known_third_party = [
     "openai",
     "litellm",
     "pytest",
-    "ray",
     "playwright",
     "redis",
     "serpapi",
