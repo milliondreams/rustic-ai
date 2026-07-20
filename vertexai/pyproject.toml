@@ -21,7 +21,7 @@ packages = [{ include = "rustic_ai", from = "src" }]
 [tool.poetry.dependencies]
 rusticai-core = { path = "../core", develop = true }
 google-cloud-aiplatform = "^1.161.0"
-google-genai = "^1.68.0"
+google-genai = "^2.12.1"
 google-cloud-language = "^2.21.0"
 tabulate = "^0.10.0"
 

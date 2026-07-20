@@ -29,7 +29,7 @@ rusticai-vertexai = { path = "../vertexai", develop = true }
 rusticai-llm-agent = { path = "../llm-agent", develop = true }
 rusticai-pandas-analyst = { path = "../pandas-analyst", develop = true }
 google-api-python-client = "^2.198.0"
-arxiv = "^2.1.0"
+arxiv = "^4.0.0"
 spacytextblob = "^5.1.0"
 spacy = "^3.8.14"
 
