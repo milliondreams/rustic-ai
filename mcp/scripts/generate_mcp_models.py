@@ -101,10 +101,10 @@ async def get_provider_tools(provider: MCPProvider) -> List[Tool]:
     if provider.token_env_var:
         token = os.environ.get(provider.token_env_var, None)
         if token:
-            if provider.token_header == "Authorization":
-                headers["Authorization"] = f"Bearer {token}"
-            else:
+            if provider.token_header and provider.token_header != "Authorization":
                 headers[provider.token_header] = token
+            else:
+                headers["Authorization"] = f"Bearer {token}"
         else:
             raise ValueError(f"Token environment variable '{provider.token_env_var}' not found")
     http_client = httpx.AsyncClient(headers=headers) if headers else None
@@ -119,10 +119,15 @@ async def get_provider_tools(provider: MCPProvider) -> List[Tool]:
                 result = await session.list_tools()
                 logger.info(f"Fetched {len(result.tools)} tool(s) from {provider.name}")
                 return result.tools
-    except Exception as e:
-        for error in e.exceptions:
+    except BaseExceptionGroup as eg:
+        # streamable_http_client runs under a task group, so failures surface
+        # as a group. Log every sub-error, not just the first.
+        for error in eg.exceptions:
             logger.error(f"Error fetching tools from {provider.name}: {error}")
-            raise
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching tools from {provider.name}: {e}")
+        raise
 
 
 def _tool_to_dict(tool: Tool) -> Dict[str, Any]:
