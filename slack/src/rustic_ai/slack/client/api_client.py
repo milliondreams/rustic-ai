@@ -57,9 +57,7 @@ class SlackAPIClient:
                 # Run sync slack-sdk call in thread pool
                 loop = asyncio.get_event_loop()
                 # Use api_call with json parameter instead of direct kwargs
-                response = await loop.run_in_executor(
-                    None, lambda: self.client.api_call(method, json=kwargs)
-                )
+                response = await loop.run_in_executor(None, lambda: self.client.api_call(method, json=kwargs))
                 # SlackResponse has a .data attribute that contains the actual dict
                 return response.data
             except SlackApiError as e:
