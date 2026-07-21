@@ -15,35 +15,37 @@ From mcp folder,
 """
 
 import argparse
+import asyncio
 import json
 import logging
 import os
-import sys
 from pathlib import Path
+import sys
 from typing import Any, Dict, List, Optional
 
+from datamodel_code_generator import (
+    DataModelType,
+    Formatter,
+    GenerateConfig,
+    InputFileType,
+    generate,
+)
 from dotenv import load_dotenv
 import httpx
-import yaml
-from datamodel_code_generator import InputFileType, generate, GenerateConfig, DataModelType, Formatter
-from mcp import Tool
 from pydantic import BaseModel, Field
+import yaml
 
-import asyncio
-
-from mcp import ClientSession
+from mcp import ClientSession, Tool
 from mcp.client.streamable_http import streamable_http_client
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
 class MCPProvider(BaseModel):
     """Configuration for an MCP provider."""
+
     name: str
     url: str
     token_env_var: Optional[str] = Field(None, description="Optional API token environment variable name")
@@ -52,6 +54,7 @@ class MCPProvider(BaseModel):
 
 class MCPProviderConfig(BaseModel):
     """Root configuration containing MCP providers."""
+
     providers: List[MCPProvider]
 
 
@@ -70,7 +73,7 @@ def load_providers_config(yaml_path: Path) -> MCPProviderConfig:
     if not yaml_path.exists():
         raise FileNotFoundError(f"YAML file not found: {yaml_path}")
 
-    with open(yaml_path, 'r') as f:
+    with open(yaml_path, "r") as f:
         config_data = yaml.safe_load(f)
 
     config = MCPProviderConfig(**config_data)
@@ -98,10 +101,10 @@ async def get_provider_tools(provider: MCPProvider) -> List[Tool]:
     if provider.token_env_var:
         token = os.environ.get(provider.token_env_var, None)
         if token:
-            if provider.token_header == "Authorization":
-                headers["Authorization"] = f"Bearer {token}"
-            else:
+            if provider.token_header and provider.token_header != "Authorization":
                 headers[provider.token_header] = token
+            else:
+                headers["Authorization"] = f"Bearer {token}"
         else:
             raise ValueError(f"Token environment variable '{provider.token_env_var}' not found")
     http_client = httpx.AsyncClient(headers=headers) if headers else None
@@ -110,16 +113,22 @@ async def get_provider_tools(provider: MCPProvider) -> List[Tool]:
             # Create a session using the client streams
             async with ClientSession(read_stream, write_stream) as session:
 
-                    # Initialize the connection
-                    await session.initialize()
-                    # List available tools
-                    result = await session.list_tools()
-                    logger.info(f"Fetched {len(result.tools)} tool(s) from {provider.name}")
-                    return result.tools
-    except Exception as e:
-        for error in e.exceptions:
+                # Initialize the connection
+                await session.initialize()
+                # List available tools
+                result = await session.list_tools()
+                logger.info(f"Fetched {len(result.tools)} tool(s) from {provider.name}")
+                return result.tools
+    except BaseExceptionGroup as eg:
+        # streamable_http_client runs under a task group, so failures surface
+        # as a group. Log every sub-error, not just the first.
+        for error in eg.exceptions:
             logger.error(f"Error fetching tools from {provider.name}: {error}")
-            raise
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching tools from {provider.name}: {e}")
+        raise
+
 
 def _tool_to_dict(tool: Tool) -> Dict[str, Any]:
     """
@@ -134,15 +143,11 @@ def _tool_to_dict(tool: Tool) -> Dict[str, Any]:
     return {
         "name": tool.name,
         "description": tool.description,
-        "inputSchema": tool.inputSchema if hasattr(tool, 'inputSchema') else {}
+        "inputSchema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
     }
 
 
-def generate_pydantic_models(
-        tools: List[Tool],
-        provider: "MCPProvider",
-        output_dir: Path
-) -> None:
+def generate_pydantic_models(tools: List[Tool], provider: "MCPProvider", output_dir: Path) -> None:
     """
     Generate Pydantic models for tool schemas using datamodel-code-generator.
 
@@ -175,8 +180,7 @@ def generate_pydantic_models(
             use_schema_description=True,
             use_annotated=True,
             skip_root_model=True,
-            custom_file_header="\"\"\" \n"
-                               + combined_models["description"] + "\n\"\"\" # noqa",
+            custom_file_header='""" \n' + combined_models["description"] + '\n""" # noqa',
             formatters=[Formatter.BLACK],
             wrap_string_literal=True,
             disable_future_imports=True,
@@ -208,14 +212,14 @@ def _derive_connectors_module(output_dir: Path) -> str:
     parts = output_dir.resolve().parts
     if "src" in parts:
         idx = len(parts) - 1 - parts[::-1].index("src")
-        return ".".join(parts[idx + 1:])
+        return ".".join(parts[idx + 1 :])
     return output_dir.name
 
 
 def _build_bound_mcp_config_comment(
-        tools: List[Tool],
-        provider: "MCPProvider",
-        connectors_module: str,
+    tools: List[Tool],
+    provider: "MCPProvider",
+    connectors_module: str,
 ) -> str:
     """Build a commented JSON snippet of a ``BoundMCPAgentConfig`` referencing
     every generated input class. Drop it into ``set_properties(...)`` (or its
@@ -224,30 +228,23 @@ def _build_bound_mcp_config_comment(
     tool_decls = [
         {
             "name": tool.name,
-            "input_class_name": (
-                f"{connectors_module}.{provider.name}."
-                f"{_snake_to_pascal_case(tool.name)}Input"
-            ),
-            "description": tool.description
+            "input_class_name": (f"{connectors_module}.{provider.name}." f"{_snake_to_pascal_case(tool.name)}Input"),
+            "description": tool.description,
         }
         for tool in tools
     ]
     agent_config = {"server": server, "tools": tool_decls}
     if provider.token_env_var and provider.token_header and provider.token_header != "Authorization":
-            agent_config["auth_header"] = provider.token_header
+        agent_config["auth_header"] = provider.token_header
     config_json = json.dumps(agent_config, indent=2)
     commented = "\n".join(f" {line}" if line else "" for line in config_json.splitlines())
-    return (
-        "\n"
-        "Example BoundMCPAgentConfig (JSON) for this provider:\n"
-        f"{commented}\n"
-    )
+    return "\n" "Example BoundMCPAgentConfig (JSON) for this provider:\n" f"{commented}\n"
 
 
 def _create_combined_schema(
-        tools: List[Tool],
-        provider: "MCPProvider",
-        output_dir: Path,
+    tools: List[Tool],
+    provider: "MCPProvider",
+    output_dir: Path,
 ) -> Dict[str, Any]:
     """
     Create a combined JSON schema containing all tool input schemas as separate definitions.
@@ -279,15 +276,13 @@ def _create_combined_schema(
             definitions[input_def_name] = input_schema_copy
             logger.info(f"Added schema definition: {input_def_name}")
 
-    description += _build_bound_mcp_config_comment(
-        tools, provider, _derive_connectors_module(output_dir)
-    )
+    description += _build_bound_mcp_config_comment(tools, provider, _derive_connectors_module(output_dir))
 
     # Create root schema that references all definitions
     root_schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": description,
-        "definitions": definitions
+        "definitions": definitions,
     }
 
     return root_schema
@@ -295,14 +290,8 @@ def _create_combined_schema(
 
 async def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="Generate Pydantic models from MCP provider schemas"
-    )
-    parser.add_argument(
-        "yaml_file",
-        type=Path,
-        help="Path to YAML file containing MCP provider configurations"
-    )
+    parser = argparse.ArgumentParser(description="Generate Pydantic models from MCP provider schemas")
+    parser.add_argument("yaml_file", type=Path, help="Path to YAML file containing MCP provider configurations")
     parser.add_argument(
         "output_dir",
         type=Path,
@@ -310,11 +299,7 @@ async def main():
         default=Path("./src/rustic_ai/mcp/connectors"),
         help="Output directory for generated model files. Default: ./src/rustic_ai/mcp/connectors",
     )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable verbose logging"
-    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
 
     args = parser.parse_args()
 
@@ -335,16 +320,13 @@ async def main():
                 tools = await get_provider_tools(provider)
 
                 # Generate models
-                generate_pydantic_models(
-                    tools,
-                    provider,
-                    args.output_dir
-                )
+                generate_pydantic_models(tools, provider, args.output_dir)
 
             except Exception as e:
                 logger.error(f"Error processing provider {provider.name}: {e}")
                 if args.verbose:
                     import traceback
+
                     traceback.print_exc()
 
         logger.info("Model generation completed successfully")
@@ -354,6 +336,7 @@ async def main():
         logger.error(f"Fatal error: {e}")
         if args.verbose:
             import traceback
+
             traceback.print_exc()
         return 1
 

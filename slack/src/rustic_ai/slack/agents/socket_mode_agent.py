@@ -68,12 +68,15 @@ class SlackSocketModeAgent(Agent):
 
     def _start_socket_mode(self):
         """Initialize and start Socket Mode client in background thread"""
+        app_token = self._app_token
+        bot_token = self._bot_token
+        if not app_token or not bot_token:
+            logging.error("Socket Mode requires both SLACK_APP_TOKEN and SLACK_BOT_TOKEN")
+            return
+
         try:
             # Create Socket Mode client
-            self._socket_client = SocketModeClient(
-                app_token=self._app_token,
-                web_client=WebClient(token=self._bot_token)
-            )
+            self._socket_client = SocketModeClient(app_token=app_token, web_client=WebClient(token=bot_token))
 
             # Register event handlers
             self._socket_client.socket_mode_request_listeners.append(
@@ -81,11 +84,7 @@ class SlackSocketModeAgent(Agent):
             )
 
             # Start in background thread
-            self._socket_thread = threading.Thread(
-                target=self._run_socket_mode,
-                daemon=True,
-                name="slack-socket-mode"
-            )
+            self._socket_thread = threading.Thread(target=self._run_socket_mode, daemon=True, name="slack-socket-mode")
             self._socket_thread.start()
 
             logging.info("Socket Mode client started successfully")
@@ -104,7 +103,13 @@ class SlackSocketModeAgent(Agent):
             self._bot_user_id = auth_response["user_id"]
 
             # Connect to Socket Mode (blocking call)
-            self._socket_client.connect()
+            socket_client = self._socket_client
+            if socket_client is None:
+                logging.error("Socket Mode client was not initialized")
+                self._is_connected = False
+                return
+
+            socket_client.connect()
             self._is_connected = True
             logging.info("Socket Mode connected and listening for events!")
 
@@ -163,7 +168,7 @@ class SlackSocketModeAgent(Agent):
                 text=event["text"],
                 thread_ts=event.get("thread_ts"),
                 event_ts=event["event_ts"],
-                envelope_id=envelope_id
+                envelope_id=envelope_id,
             )
 
             logging.info(f"✉️  Created SlackEventMessage for app_mention: {event_msg}")
@@ -177,9 +182,11 @@ class SlackSocketModeAgent(Agent):
     def _handle_message(self, event: dict, envelope_id: str):
         """Handle regular messages in channels bot is in (DMs only - mentions are handled by app_mention)"""
         try:
-            logging.info(f"💬 Processing message: user={event.get('user')}, channel={event.get('channel')}, "
-                         f"bot_id={event.get('bot_id')}, subtype={event.get('subtype')}, "
-                         f"channel_type={event.get('channel_type')}")
+            logging.info(
+                f"💬 Processing message: user={event.get('user')}, channel={event.get('channel')}, "
+                f"bot_id={event.get('bot_id')}, subtype={event.get('subtype')}, "
+                f"channel_type={event.get('channel_type')}"
+            )
 
             # Skip if:
             # - Bot's own message
@@ -211,12 +218,14 @@ class SlackSocketModeAgent(Agent):
                     text=text,
                     thread_ts=event.get("thread_ts"),
                     event_ts=event["event_ts"],
-                    envelope_id=envelope_id
+                    envelope_id=envelope_id,
                 )
 
                 self._publish_event_to_guild(event_msg)
             else:
-                logging.info("⏭️  Skipping channel message (not a DM, already handled by app_mention if bot was mentioned)")
+                logging.info(
+                    "⏭️  Skipping channel message (not a DM, already handled by app_mention if bot was mentioned)"
+                )
 
         except Exception as e:
             logging.error(f"❌ Error handling message: {e}", exc_info=True)

@@ -14,6 +14,7 @@ from typing import (
     Type,
     TypeVar,
     Union,
+    cast,
 )
 
 import chevron
@@ -1089,8 +1090,9 @@ class RouteBuilder:
             self.rule_dict[RoutingKeys.AGENT.value] = AgentTag(name=from_agent.name)
         elif isinstance(from_agent, AgentTag):
             self.rule_dict[RoutingKeys.AGENT.value] = from_agent
-        elif isclass(from_agent) and issubclass(from_agent, Agent):
-            self.rule_dict[RoutingKeys.AGENT_TYPE.value] = from_agent.get_qualified_class_name()
+        elif isinstance(from_agent, type) and issubclass(from_agent, Agent):
+            agent_type = cast(Type[Agent], from_agent)
+            self.rule_dict[RoutingKeys.AGENT_TYPE.value] = agent_type.get_qualified_class_name()
         else:
             raise ValueError("Invalid from_agent type")
 
