@@ -38,6 +38,7 @@ flake8 = "^7.3.0"
 tox = "^4.57.1"
 isort = "^8.0.1"
 mypy = "^2.3.0"
+pandas = "^3.0.3"
 
 [tool.poetry.extras]
 test = ["pytest"]
