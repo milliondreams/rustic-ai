@@ -77,6 +77,7 @@ class SERPAgent(Agent):
             message (Message): The received message.
         """
         search_query = ctx.payload
+        self.logger.debug(f"Received search query: {search_query.query} for engine: {search_query.engine}")
 
         # Use the message.payload as search parameters
         search_params = SearchEngines[search_query.engine].get_query(search_query.query)
@@ -130,14 +131,16 @@ class SERPAgent(Agent):
             if "search_information" in results and "total_results" in results["search_information"]:
                 total_results = results["search_information"]["total_results"]
 
+            self.logger.debug(f"Publishing {len(result_links)} search results for query: {search_query.query} with total results: {total_results}")
+
             ctx.send(
                 SERPResults(
                     count=len(result_links),
                     results=result_links,
                     total_results=total_results,
                     id=search_query.id,
-                    query=result["search_parameters"]["q"],
-                    engine=result["search_parameters"]["engine"],
+                    query=search_query.query,
+                    engine=search_query.engine,
                 ),
                 new_thread=True,
             )

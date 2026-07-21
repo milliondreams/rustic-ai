@@ -94,7 +94,12 @@ class DataAnalystReActToolset(ReActToolset):
 
         This is called by ReActAgent at the start of processing to provide
         guild context. When use_guild_filesystem is True, the filesystem path
-        is constructed as: {filesystem_base_path}/{org_id}/{guild_id}/GUILD_GLOBAL
+        is constructed as: {base_path}/{org_id}/{guild_id}/GUILD_GLOBAL
+
+        The base_path is taken from filesystem_base_path, which callers must
+        configure (via the guild/agent config) to match the root used by the
+        guild file-upload/download API endpoints, otherwise load_file will
+        raise FileNotFoundError.
 
         Args:
             org_id: The organization ID.

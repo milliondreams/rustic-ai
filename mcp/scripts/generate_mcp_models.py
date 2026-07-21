@@ -112,7 +112,6 @@ async def get_provider_tools(provider: MCPProvider) -> List[Tool]:
         async with streamable_http_client(provider.url, http_client=http_client) as (read_stream, write_stream, _):
             # Create a session using the client streams
             async with ClientSession(read_stream, write_stream) as session:
-
                 # Initialize the connection
                 await session.initialize()
                 # List available tools

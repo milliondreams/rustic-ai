@@ -40,6 +40,7 @@ class GoogleResearchAgent(Agent[GoogleResearchAgentProps], VertexAIBase):
     @agent.processor(SERPQuery)
     async def on_message(self, ctx: agent.ProcessContext[SERPQuery]):
         query = ctx.payload.query
+        self.logger.debug(f"Received research query: {query}")
 
         try:
             if not self.genai_client:
@@ -100,6 +101,9 @@ class GoogleResearchAgent(Agent[GoogleResearchAgentProps], VertexAIBase):
                 model=self.config.model_id,
                 created=int(datetime.now().timestamp()),
             )
+
+            self.logger.debug(f"Sending research findings for query: {query} with ID: {query_id} and grounding info: {grounding}")
+
             ctx.send(payload=ccr, reason=grounding)
         except Exception as e:
             ctx.send_error(

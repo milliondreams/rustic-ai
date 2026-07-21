@@ -42,6 +42,8 @@ class LLMAgent(Agent[LLMAgentConfig]):
         """
         prompt = ctx.payload
 
+        self.logger.debug(f"Invoking LLM with prompt: {prompt.messages}")
+
         if self._system_prompt:
             # If the system prompt was updated, add it to the messages.
             messages = [SystemMessage(content=self._system_prompt)] + prompt.messages
@@ -51,13 +53,15 @@ class LLMAgent(Agent[LLMAgentConfig]):
             messages = [SystemMessage(content=self.config.default_system_prompt)] + prompt.messages
             prompt = prompt.model_copy(update={"messages": messages})
 
-        LLMAgentHelper.invoke_llm_and_handle_response(
+        resp = LLMAgentHelper.invoke_llm_and_handle_response(
             self,
             self.config,
             llm,
             ctx,
             prompt,
         )
+
+        self.logger.debug(f"LLM response: {resp}")
 
     @processor(
         ChatCompletionRequest,

@@ -21,6 +21,7 @@ class BasicWiringAgent(Agent):
         Args:
             ctx (ProcessContext[JsonDict]): The context of the message being processed.
         """
+        self.logger.debug(f"Wiring message: {ctx.payload}")
         ctx.send_dict(
             ctx.payload,
             format=ctx.message.format,

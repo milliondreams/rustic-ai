@@ -180,8 +180,11 @@ class SplitterAgent(Agent[SplitterConf]):
     @agent.processor(JsonDict)
     def split_and_send(self, ctx: ProcessContext[JsonDict]) -> None:
         try:
+            self.logger.debug(f"Received payload for splitting: {ctx.payload}")
             items = self.splitter.split(ctx.payload)
             payload_with_format = self.format_selector.get_formats(items)
+
+            self.logger.debug(f"Split into {len(items)} items and generated {len(payload_with_format)} formatted payloads.")
 
             if len(payload_with_format) != len(items):
                 ctx.send_error(
@@ -194,8 +197,10 @@ class SplitterAgent(Agent[SplitterConf]):
                 return
 
             for res in payload_with_format:
+                self.logger.debug(f"Sending formatted payload: {res.payload} with format: {res.format}")
                 ctx.send_dict(payload=res.payload, format=res.format)
         except Exception as e:
+            self.logger.error(f"Error during splitting and sending: {str(e)}", exc_info=True)
             ctx.send_error(
                 ErrorMessage(
                     agent_type=self.get_qualified_class_name(),
