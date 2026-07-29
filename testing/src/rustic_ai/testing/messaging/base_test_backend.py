@@ -11,7 +11,7 @@ from rustic_ai.core.messaging.core.message import (
     Priority,
 )
 from rustic_ai.core.messaging.core.messaging_backend import MessagingBackend
-from rustic_ai.core.utils.gemstone_id import GemstoneGenerator
+from rustic_ai.core.utils.gemstone_id import EPOCH, GemstoneGenerator, GemstoneID
 
 
 class BaseTestBackendABC(ABC):
@@ -288,98 +288,97 @@ class BaseTestBackendABC(ABC):
 
     # Test method to get messages since a given message ID ensuring newer messages with higher priority are not lost
     def test_get_messages_for_topic_since_with_higher_priority(
-        self, backend: MessagingBackend, generator: GemstoneGenerator, topic: str, request
+        self, backend: MessagingBackend, request
     ):
         """
-        Test retrieving messages for a topic since a given message ID ensuring newer messages with higher priority are not lost.
+        Verify the Redis/NATS contract for a guild's default topic at a
+        priority-inverted timestamp boundary.
         """
-        id1 = generator.get_id(Priority.NORMAL)
-        id2 = generator.get_id(Priority.NORMAL)
-        id3 = generator.get_id(Priority.NORMAL)
-        time.sleep(0.001)
-        id4 = generator.get_id(Priority.NORMAL)
-        time.sleep(0.001)
-        id5 = generator.get_id(Priority.NORMAL)
-        id6 = generator.get_id(Priority.NORMAL)
-        time.sleep(0.001)
-        id7 = generator.get_id(Priority.HIGH)
-        id8 = generator.get_id(Priority.URGENT)
+        base_timestamp = EPOCH + 1_000_000
+        boundary = GemstoneID(Priority.NORMAL, base_timestamp, 1, 0)
+        same_millisecond = GemstoneID(Priority.NORMAL, base_timestamp, 1, 1)
+        later_normal = GemstoneID(Priority.NORMAL, base_timestamp + 1, 1, 0)
+        later_high = GemstoneID(Priority.HIGH, base_timestamp + 2, 1, 0)
+        later_urgent = GemstoneID(Priority.URGENT, base_timestamp + 3, 1, 0)
 
+        assert later_high.to_int() < boundary.to_int()
+        assert later_urgent.to_int() < boundary.to_int()
+
+        namespace = f"guild_{request.node.name}"
+        topic = f"{namespace}:default_topic"
         sender = AgentTag(id="senderId", name="sender")
 
-        m1 = Message(
-            topics=topic,
-            sender=sender,
-            format=MessageConstants.RAW_JSON_FORMAT,
-            payload={"key": "m1"},
-            id_obj=id1,
+        def make_message(label: str, id_obj: GemstoneID) -> Message:
+            return Message(
+                topics="default_topic",
+                sender=sender,
+                format=MessageConstants.RAW_JSON_FORMAT,
+                payload={"label": label},
+                id_obj=id_obj,
+                topic_published_to="default_topic",
+            )
+
+        fixtures = [
+            make_message("boundary", boundary),
+            make_message("same_millisecond", same_millisecond),
+            make_message("later_normal", later_normal),
+            make_message("later_high", later_high),
+            make_message("later_urgent", later_urgent),
+        ]
+        for message in fixtures:
+            backend.store_message(namespace, topic, message)
+
+        retrieved_messages = backend.get_messages_for_topic_since(topic, boundary.to_int())
+        actual_ids = [message.id for message in retrieved_messages]
+        expected_ids = [
+            later_urgent.to_int(),
+            later_high.to_int(),
+            later_normal.to_int(),
+        ]
+        returned_details = [
+            (
+                f"{message.payload['label']}"
+                f"(priority={int(message.priority)},"
+                f"timestamp={int(message.timestamp)},id={message.id})"
+            )
+            for message in retrieved_messages
+        ]
+        assert actual_ids == expected_ids, (
+            f"cursor={boundary.to_int()}"
+            f"(priority={boundary.priority},timestamp={boundary.timestamp}), "
+            f"returned={returned_details}"
         )
-        m2 = Message(
-            topics=topic,
-            sender=sender,
-            format=MessageConstants.RAW_JSON_FORMAT,
-            payload={"key": "m2"},
-            id_obj=id2,
-        )
-        m3 = Message(
-            topics=topic,
-            sender=sender,
-            format=MessageConstants.RAW_JSON_FORMAT,
-            payload={"key": "m3"},
-            id_obj=id3,
-        )
-        m4 = Message(
-            topics=topic,
-            sender=sender,
-            format=MessageConstants.RAW_JSON_FORMAT,
-            payload={"key": "m4"},
-            id_obj=id4,
-        )
-        m5 = Message(
-            topics=topic,
-            sender=sender,
-            format=MessageConstants.RAW_JSON_FORMAT,
-            payload={"key": "m5"},
-            id_obj=id5,
-        )
-        m6 = Message(
-            topics=topic,
-            sender=sender,
-            format=MessageConstants.RAW_JSON_FORMAT,
-            payload={"key": "m6"},
-            id_obj=id6,
-        )
-        m7 = Message(
-            topics=topic,
-            sender=sender,
-            format=MessageConstants.RAW_JSON_FORMAT,
-            payload={"key": "m7"},
-            id_obj=id7,
-        )
-        m8 = Message(
-            topics=topic,
-            sender=sender,
-            format=MessageConstants.RAW_JSON_FORMAT,
-            payload={"key": "m8"},
-            id_obj=id8,
+        assert all(
+            message.topic_published_to == "default_topic"
+            for message in retrieved_messages
         )
 
-        namespace = request.node.name
-        # Add messages to the topic
-        backend.store_message(namespace, topic, m1)
-        backend.store_message(namespace, topic, m2)
-        backend.store_message(namespace, topic, m3)
-        backend.store_message(namespace, topic, m4)
-        backend.store_message(namespace, topic, m5)
-        backend.store_message(namespace, topic, m6)
-        backend.store_message(namespace, topic, m7)
-        backend.store_message(namespace, topic, m8)
+        history = backend.get_messages_for_topic(topic)
+        assert [message.id for message in history] == [
+            later_urgent.to_int(),
+            later_high.to_int(),
+            boundary.to_int(),
+            same_millisecond.to_int(),
+            later_normal.to_int(),
+        ]
 
-        # Retrieve messages for the topic since a given message ID
-        retrieved_messages = backend.get_messages_for_topic_since(topic, id3.to_int())
+        by_id = backend.get_messages_by_id(
+            namespace,
+            [later_high.to_int(), 999999999, boundary.to_int()],
+        )
+        assert [message.id for message in by_id] == [
+            later_high.to_int(),
+            boundary.to_int(),
+        ]
 
-        # Check the order of the retrieved messages
-        assert retrieved_messages == [m8, m7, m4, m5, m6]
+        other_namespace = f"{namespace}_other"
+        other_topic = f"{other_namespace}:default_topic"
+        backend.store_message(
+            other_namespace,
+            other_topic,
+            make_message("other_guild", later_normal),
+        )
+        assert len(backend.get_messages_for_topic(topic)) == len(fixtures)
 
     # Test subscription on a topic
     def test_subscribe(self, backend: MessagingBackend, generator: GemstoneGenerator, topic: str, request):
