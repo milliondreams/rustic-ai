@@ -1,10 +1,18 @@
 import json
 import logging
 import time
-from typing import List, Optional, Union
+from typing import List, Literal, Optional, Union
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    create_model,
+    field_serializer,
+    field_validator,
+)
 
 from rustic_ai.core.guild.agent import Agent, ProcessContext, processor
 from rustic_ai.core.guild.agent_ext.depends.llm.llm import LLM
@@ -13,6 +21,7 @@ from rustic_ai.core.guild.agent_ext.depends.llm.models import (
     ChatCompletionError,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatCompletionToolChoiceOption,
     Choice,
     CompletionUsage,
     DiscriminatedLLMMessage,
@@ -22,6 +31,7 @@ from rustic_ai.core.guild.agent_ext.depends.llm.models import (
     ToolMessage,
     UserMessage,
 )
+from rustic_ai.core.guild.agent_ext.depends.llm.tools_manager import ToolSpec
 from rustic_ai.core.guild.dsl import BaseAgentProps
 from rustic_ai.core.utils.basic_class_utils import get_class_from_name
 from rustic_ai.llm_agent.llm_agent_conf import Models
@@ -37,28 +47,37 @@ from rustic_ai.llm_agent.plugins.tool_call_wrapper import (
 )
 
 from .models import ReActStep
-from .toolset import ReActToolset
+from .toolset import (
+    ReActSkillSpec,
+    ReActToolOutcome,
+    ReActToolset,
+    ToolOutcomeDisposition,
+)
 
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_REACT_SYSTEM_PROMPT = """You are an AI assistant that uses the ReAct (Reasoning and Acting) pattern to solve problems.
+DEFAULT_REACT_SYSTEM_PROMPT = """Use the available tools for exact or verifiable results.
 
-For each step, you should:
-1. **Think**: Reason about the current situation and what action to take next
-2. **Act**: Call a tool if you need more information or to perform an action
-3. **Observe**: Analyze the result from the tool
-
-Continue this process until you have enough information to provide a final answer.
-
-When you have gathered sufficient information, provide your final answer directly without calling any tools.
-
-Important guidelines:
-- Always explain your reasoning before taking an action
-- Use tools when you need external information or to perform specific tasks
-- If a tool returns an error, try to understand the issue and adapt your approach
-- Provide clear, concise final answers based on the information gathered
+- Call tools directly without narrating a plan.
+- For multi-part requests, identify every requested result and complete each one.
+- For dependent steps, use the exact result of the previous tool call as the next input.
+- Call each required tool once. After an error, make at most one corrected call and never repeat identical arguments.
+- In the final answer, include every requested result and preserve tool-returned values, dates, units, timezones, and
+  precision. Round only when requested.
+- Ask for clarification when required information is missing or ambiguous. Never replace an unavailable tool result
+  with a guess.
 """
+
+SKILL_SELECTOR_TOOL = "activate_tool_skill"
+
+
+class ActivateToolSkillArgs(BaseModel):
+    """Activate one related tool group for progressive disclosure."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    skill: str = Field(description="One skill needed for the next tool action.")
 
 
 class ReActAgentConfig(BaseAgentProps, LLMPluginMixin):
@@ -116,6 +135,21 @@ class ReActAgentConfig(BaseAgentProps, LLMPluginMixin):
     """
     The toolset that defines available tools and their execution logic.
     """
+
+    failure_handling: Literal["safe", "legacy"] = Field(default="safe")
+    """Safe mode bounds retries and grounds failures; legacy preserves the unrestricted loop."""
+
+    tool_disclosure: Literal["all", "skills"] = Field(default="all")
+    """Expose all tools immediately or progressively disclose configured skill groups."""
+
+    skill_activation_followup: Literal["auto", "required"] = Field(default="auto")
+    """Optionally require one disclosed domain-tool call immediately after activating a skill."""
+
+    skill_activation_observation: Literal["standard", "explicit"] = Field(default="standard")
+    """Control whether activation results explicitly distinguish disclosure from task completion."""
+
+    skill_disclosure_progression: Literal["sticky", "expand_after_first_success"] = Field(default="sticky")
+    """Keep activated groups scoped, or expose the full catalog after the first successful domain action."""
 
     base_url: Optional[str] = None
     """Base URL for the LLM API."""
@@ -217,6 +251,8 @@ class ReActAgentConfig(BaseAgentProps, LLMPluginMixin):
         "max_iterations",
         "toolset",
         "system_prompt",
+        "failure_handling",
+        "tool_disclosure",
     }
 
     def has_iteration_plugins(self) -> bool:
@@ -360,6 +396,10 @@ class ReActAgent(Agent[ReActAgentConfig]):
                 [],
             )
 
+        skill_specs = self.config.toolset.get_skill_specs() if self.config.tool_disclosure == "skills" else []
+        self._validate_skill_specs(self.config.toolset, skill_specs)
+        skill_mode = bool(skill_specs)
+
         # Build the messages list: incoming system messages + ReAct system prompt + user query
         initial_messages: List[DiscriminatedLLMMessage] = []
 
@@ -367,7 +407,8 @@ class ReActAgent(Agent[ReActAgentConfig]):
         for sys_msg in incoming_system_messages:
             initial_messages.append(sys_msg)
 
-        # Append the ReAct system prompt
+        # The selector tool carries the incremental-disclosure contract so custom
+        # replacement prompts receive the same model-facing instructions.
         initial_messages.append(SystemMessage(content=self._get_system_prompt()))
 
         # Append the user query
@@ -375,9 +416,14 @@ class ReActAgent(Agent[ReActAgentConfig]):
 
         # Build initial request with tools from toolset
         # Use temperature/max_tokens from incoming request if provided, else fall back to config
+        initial_tools = (
+            [self._skill_selector_spec(skill_specs).chat_tool]
+            if skill_mode
+            else (self.config.toolset.chat_tools if self.config.toolset.tool_count > 0 else None)
+        )
         initial_request = ChatCompletionRequest(
             messages=initial_messages,
-            tools=self.config.toolset.chat_tools if self.config.toolset.tool_count > 0 else None,
+            tools=initial_tools,
             temperature=incoming_request.temperature or self.config.temperature,
             max_tokens=incoming_request.max_tokens or self.config.max_tokens,
         )
@@ -395,15 +441,39 @@ class ReActAgent(Agent[ReActAgentConfig]):
         iterations_completed = 0
         total_usage = CompletionUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0)
 
+        safe_handling = self.config.failure_handling == "safe"
+        executed_calls: dict[str, ReActToolOutcome | None] = {}
+        failure_attempts: dict[tuple[str, str], int] = {}
+        verified_results: list[dict[str, str]] = []
+        unresolved_failures: list[dict[str, str]] = []
+        last_interpreted_tool: Optional[str] = None
+        policy_termination: Optional[str] = None
+        active_skill_names: set[str] = set()
+        domain_tool_required = False
+        disclosure_expanded = False
+
         all_iteration_messages: list = []  # Accumulate messages from iteration plugins
 
         for iteration in range(self.config.max_iterations):
             iterations_completed = iteration + 1
+            advertised_tool_names = {
+                tool.function.name for tool in (tools or []) if getattr(tool, "function", None) is not None
+            }
 
             # Build request for this iteration
+            iteration_tools = tools
+            tool_choice = None
+            if domain_tool_required and self.config.skill_activation_followup == "required":
+                iteration_tools = [
+                    tool
+                    for tool in (tools or [])
+                    if getattr(getattr(tool, "function", None), "name", None) != SKILL_SELECTOR_TOOL
+                ]
+                tool_choice = ChatCompletionToolChoiceOption.required
             iteration_request = ChatCompletionRequest(
                 messages=messages,
-                tools=tools,
+                tools=iteration_tools,
+                tool_choice=tool_choice,
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
             )
@@ -448,6 +518,8 @@ class ReActAgent(Agent[ReActAgentConfig]):
             if not assistant_message.tool_calls:
                 # No tool calls - this is the final answer
                 final_response = response
+                if safe_handling and unresolved_failures:
+                    policy_termination = "unresolved_tool_failure"
                 break
 
             # Process each tool call
@@ -456,13 +528,26 @@ class ReActAgent(Agent[ReActAgentConfig]):
                 try:
                     tool_args = json.loads(tool_call.function.arguments)
                 except json.JSONDecodeError as e:
-                    tool_result = f"Error parsing tool arguments: {e}"
+                    tool_result = self._structured_tool_error(
+                        "invalid_arguments",
+                        f"Tool arguments are not valid JSON: {self._bounded_error(e)}",
+                    )
+                    argument_error_outcome = ReActToolOutcome(
+                        disposition=ToolOutcomeDisposition.RETRYABLE_ERROR,
+                        code="invalid_arguments",
+                        message="Tool arguments were not valid JSON.",
+                    )
+                    attempt = self._record_failure_attempt(failure_attempts, tool_name, argument_error_outcome)
                     trace.append(
                         ReActStep(
                             thought=assistant_message.content,
                             action=tool_name,
                             action_input={"raw": tool_call.function.arguments},
                             observation=tool_result,
+                            outcome=argument_error_outcome.disposition.value,
+                            error_code=argument_error_outcome.code,
+                            attempt=attempt,
+                            model_round=iterations_completed,
                         )
                     )
                     messages.append(
@@ -471,13 +556,124 @@ class ReActAgent(Agent[ReActAgentConfig]):
                             content=tool_result,
                         )
                     )
+                    self._append_failure(unresolved_failures, tool_name, argument_error_outcome)
+                    last_interpreted_tool = tool_name
+                    if safe_handling and attempt >= 2:
+                        policy_termination = "tool_retry_exhausted"
+                    continue
+
+                if skill_mode and tool_name == SKILL_SELECTOR_TOOL:
+                    selection_result, selection_outcome, activated = self._activate_skill(
+                        tool_args,
+                        skill_specs,
+                        active_skill_names,
+                    )
+                    if activated:
+                        active_skill_names.add(activated)
+                        tools = self._disclosed_tools(skill_specs, active_skill_names)
+                        domain_tool_required = True
+                    attempt = 1
+                    if selection_outcome.disposition != ToolOutcomeDisposition.SUCCESS:
+                        attempt = self._record_failure_attempt(failure_attempts, tool_name, selection_outcome)
+                    trace.append(
+                        ReActStep(
+                            thought=assistant_message.content,
+                            action=tool_name,
+                            action_input=tool_args if isinstance(tool_args, dict) else {"raw": tool_args},
+                            observation=selection_result,
+                            outcome=selection_outcome.disposition.value,
+                            error_code=selection_outcome.code,
+                            attempt=attempt,
+                            executed=False,
+                            model_round=iterations_completed,
+                        )
+                    )
+                    messages.append(ToolMessage(tool_call_id=tool_call.id, content=selection_result))
+                    if selection_outcome.disposition == ToolOutcomeDisposition.SUCCESS:
+                        self._resolve_latest_failure(unresolved_failures, tool_name)
+                    else:
+                        self._append_failure(unresolved_failures, tool_name, selection_outcome)
+                        if safe_handling and attempt >= 2:
+                            policy_termination = "tool_retry_exhausted"
+                    continue
+
+                if skill_mode and tool_name not in advertised_tool_names:
+                    tool_result = self._structured_tool_error(
+                        "tool_not_disclosed",
+                        "This tool is not available yet. Activate its skill, then call the tool in a later round.",
+                    )
+                    disclosure_outcome = ReActToolOutcome(
+                        disposition=ToolOutcomeDisposition.RETRYABLE_ERROR,
+                        code="tool_not_disclosed",
+                        message="The tool was called before it was disclosed.",
+                    )
+                    attempt = self._record_failure_attempt(failure_attempts, tool_name, disclosure_outcome)
+                    trace.append(
+                        ReActStep(
+                            thought=assistant_message.content,
+                            action=tool_name,
+                            action_input=tool_args,
+                            observation=tool_result,
+                            outcome=disclosure_outcome.disposition.value,
+                            error_code=disclosure_outcome.code,
+                            attempt=attempt,
+                            executed=False,
+                            model_round=iterations_completed,
+                        )
+                    )
+                    messages.append(ToolMessage(tool_call_id=tool_call.id, content=tool_result))
+                    self._append_failure(unresolved_failures, tool_name, disclosure_outcome)
+                    last_interpreted_tool = tool_name
+                    if safe_handling and attempt >= 2:
+                        policy_termination = "tool_retry_exhausted"
+                    continue
+
+                fingerprint = self._tool_call_fingerprint(tool_name, tool_args)
+                if safe_handling and fingerprint in executed_calls:
+                    previous_outcome = executed_calls[fingerprint]
+                    tool_result = self._structured_tool_error(
+                        "duplicate_tool_call",
+                        "This exact tool call was already executed; use its existing observation.",
+                    )
+                    duplicate_outcome = ReActToolOutcome(
+                        disposition=ToolOutcomeDisposition.TERMINAL_ERROR,
+                        code="duplicate_tool_call",
+                        message="An identical tool call was suppressed.",
+                    )
+                    previous_succeeded = (
+                        previous_outcome is not None and previous_outcome.disposition == ToolOutcomeDisposition.SUCCESS
+                    )
+                    trace.append(
+                        ReActStep(
+                            thought=assistant_message.content,
+                            action=tool_name,
+                            action_input=tool_args,
+                            observation=tool_result,
+                            outcome=duplicate_outcome.disposition.value,
+                            error_code=duplicate_outcome.code,
+                            attempt=2,
+                            executed=False,
+                            model_round=iterations_completed,
+                        )
+                    )
+                    messages.append(ToolMessage(tool_call_id=tool_call.id, content=tool_result))
+                    if not previous_succeeded:
+                        self._append_failure(unresolved_failures, tool_name, duplicate_outcome)
+                    policy_termination = "duplicate_tool_call"
+                    last_interpreted_tool = tool_name
                     continue
 
                 # Execute tool with wrapper pipeline
-                tool_result, tool_messages = self._execute_tool_with_wrappers(
+                tool_result, tool_messages, outcome = self._execute_tool_with_wrappers(
                     ctx, tool_name, tool_args, toolset, assistant_message.content
                 )
+                domain_tool_required = False
                 all_iteration_messages.extend(tool_messages)
+                executed_calls[fingerprint] = outcome
+
+                attempt = 1
+                if outcome and outcome.disposition != ToolOutcomeDisposition.SUCCESS:
+                    attempt = self._record_failure_attempt(failure_attempts, tool_name, outcome)
 
                 # Record in trace
                 trace.append(
@@ -486,6 +682,10 @@ class ReActAgent(Agent[ReActAgentConfig]):
                         action=tool_name,
                         action_input=tool_args,
                         observation=tool_result,
+                        outcome=outcome.disposition.value if outcome else None,
+                        error_code=outcome.code if outcome else None,
+                        attempt=attempt,
+                        model_round=iterations_completed,
                     )
                 )
 
@@ -497,6 +697,39 @@ class ReActAgent(Agent[ReActAgentConfig]):
                     )
                 )
 
+                if (
+                    skill_mode
+                    and not disclosure_expanded
+                    and self.config.skill_disclosure_progression == "expand_after_first_success"
+                    and (outcome is None or outcome.disposition == ToolOutcomeDisposition.SUCCESS)
+                ):
+                    tools = toolset.chat_tools if toolset.tool_count > 0 else None
+                    disclosure_expanded = True
+
+                if not safe_handling or outcome is None:
+                    last_interpreted_tool = None
+                    continue
+
+                if outcome.disposition == ToolOutcomeDisposition.SUCCESS:
+                    if outcome.verified_summary:
+                        verified_results.append({"tool": tool_name, "summary": outcome.verified_summary})
+                    if last_interpreted_tool == tool_name:
+                        self._resolve_latest_failure(unresolved_failures, tool_name)
+                    last_interpreted_tool = tool_name
+                    continue
+
+                self._append_failure(unresolved_failures, tool_name, outcome)
+                last_interpreted_tool = tool_name
+                if outcome.disposition == ToolOutcomeDisposition.CLARIFICATION_REQUIRED:
+                    policy_termination = "clarification_required"
+                elif outcome.disposition == ToolOutcomeDisposition.TERMINAL_ERROR:
+                    policy_termination = "tool_failure"
+                elif attempt >= 2:
+                    policy_termination = "tool_retry_exhausted"
+
+            if policy_termination:
+                break
+
         # POSTPROCESS (once, after loop)
         loop_plugin_messages = self._postprocess_if_needed(ctx, llm, prepared_request, final_response)
 
@@ -504,6 +737,19 @@ class ReActAgent(Agent[ReActAgentConfig]):
         all_plugin_messages = all_iteration_messages + loop_plugin_messages
 
         # Build final response as ChatCompletionResponse
+        if policy_termination:
+            return (
+                self._build_policy_response(
+                    start_time=start_time,
+                    trace=trace,
+                    iterations=iterations_completed,
+                    usage=total_usage,
+                    termination_reason=policy_termination,
+                    verified_results=verified_results,
+                    unresolved_failures=unresolved_failures,
+                ),
+                all_plugin_messages,
+            )
         if final_response:
             return (
                 self._build_success_response(
@@ -512,20 +758,30 @@ class ReActAgent(Agent[ReActAgentConfig]):
                     trace=trace,
                     iterations=iterations_completed,
                     usage=total_usage,
+                    termination_reason="completed",
                 ),
                 all_plugin_messages,
             )
         else:
             # Max iterations reached
-            return (
-                self._build_max_iterations_response(
+            if safe_handling and (verified_results or unresolved_failures):
+                response = self._build_policy_response(
                     start_time=start_time,
                     trace=trace,
                     iterations=self.config.max_iterations,
                     usage=total_usage,
-                ),
-                all_plugin_messages,
-            )
+                    termination_reason="max_iterations",
+                    verified_results=verified_results,
+                    unresolved_failures=unresolved_failures,
+                )
+            else:
+                response = self._build_max_iterations_response(
+                    start_time=start_time,
+                    trace=trace,
+                    iterations=self.config.max_iterations,
+                    usage=total_usage,
+                )
+            return (response, all_plugin_messages)
 
     def _preprocess_if_needed(
         self,
@@ -631,6 +887,133 @@ class ReActAgent(Agent[ReActAgentConfig]):
             return self.config.system_prompt
         return DEFAULT_REACT_SYSTEM_PROMPT
 
+    @staticmethod
+    def _skill_selector_spec(skills: List[ReActSkillSpec]) -> ToolSpec:
+        skill_names = tuple(skill.name for skill in skills)
+        skill_type = Literal.__getitem__(skill_names)
+        args_model = create_model(
+            "AvailableToolSkillArgs",
+            __base__=ActivateToolSkillArgs,
+            skill=(skill_type, Field(description="One available skill needed for the next tool action.")),
+        )
+        descriptions = "; ".join(
+            f"{skill.name}: {skill.description}"
+            + (f" Examples: {', '.join(skill.examples)}." if skill.examples else "")
+            for skill in skills
+        )
+        return ToolSpec(
+            name=SKILL_SELECTOR_TOOL,
+            description=(
+                "Activate exactly one skill needed for the next tool action. Its tools become available after this "
+                "call. Call this selector again later if another step needs a different skill; do not predict or "
+                "activate every skill upfront. You may make separate activation calls in the same response for "
+                "independent subtasks. Do not activate a skill when no tool is needed. "
+                f"Available skills: {descriptions}"
+            ),
+            parameter_class=args_model,
+        )
+
+    @staticmethod
+    def _validate_skill_specs(toolset: ReActToolset, skills: List[ReActSkillSpec]) -> None:
+        if not skills:
+            return
+        if SKILL_SELECTOR_TOOL in toolset.tool_names:
+            raise ValueError(f"Tool name {SKILL_SELECTOR_TOOL!r} is reserved for progressive disclosure")
+        names = [skill.name for skill in skills]
+        if len(names) != len(set(names)):
+            raise ValueError("ReAct skill names must be unique")
+        known_tools = set(toolset.tool_names)
+        covered_tools: set[str] = set()
+        for skill in skills:
+            unknown = set(skill.tool_names) - known_tools
+            if unknown:
+                raise ValueError(f"Skill {skill.name!r} references unknown tools: {sorted(unknown)}")
+            covered_tools.update(skill.tool_names)
+        uncovered = known_tools - covered_tools
+        if uncovered:
+            raise ValueError(f"Progressive disclosure metadata does not cover tools: {sorted(uncovered)}")
+
+    def _disclosed_tools(
+        self,
+        skills: List[ReActSkillSpec],
+        active_names: set[str],
+    ) -> List:
+        selected_tools = {tool_name for skill in skills if skill.name in active_names for tool_name in skill.tool_names}
+        tools = [self._skill_selector_spec(skills).chat_tool]
+        tools.extend(spec.chat_tool for spec in self.config.toolset.get_toolspecs() if spec.name in selected_tools)
+        return tools
+
+    def _activate_skill(
+        self,
+        arguments: object,
+        skills: List[ReActSkillSpec],
+        active_names: set[str],
+    ) -> tuple[str, ReActToolOutcome, Optional[str]]:
+        known = {skill.name: skill for skill in skills}
+        try:
+            parsed = ActivateToolSkillArgs.model_validate(arguments)
+        except ValidationError as exc:
+            result = self._structured_tool_error("invalid_skill_activation", self._validation_error_message(exc))
+            return (
+                result,
+                ReActToolOutcome(
+                    disposition=ToolOutcomeDisposition.RETRYABLE_ERROR,
+                    code="invalid_skill_activation",
+                    message="Skill activation arguments are invalid.",
+                ),
+                None,
+            )
+        if parsed.skill not in known:
+            result = self._structured_tool_error(
+                "unknown_skill",
+                f"Unknown skill: {parsed.skill}. Available: {', '.join(sorted(known))}.",
+            )
+            return (
+                result,
+                ReActToolOutcome(
+                    disposition=ToolOutcomeDisposition.RETRYABLE_ERROR,
+                    code="unknown_skill",
+                    message="The requested skill does not exist.",
+                ),
+                None,
+            )
+        if parsed.skill in active_names:
+            result = self._structured_tool_error(
+                "already_active",
+                "That skill is already active; use its exposed tools or activate a different skill.",
+            )
+            return (
+                result,
+                ReActToolOutcome(
+                    disposition=ToolOutcomeDisposition.RETRYABLE_ERROR,
+                    code="already_active",
+                    message="The requested skill is already active.",
+                ),
+                None,
+            )
+        activated = known[parsed.skill]
+        active_after = active_names | {parsed.skill}
+        available_tools = [
+            tool_name for skill in skills if skill.name in active_after for tool_name in skill.tool_names
+        ]
+        payload = {
+            "status": "ok",
+            "activated_skill": parsed.skill,
+            "active_skills": sorted(active_after),
+            "available_tools": available_tools,
+            "instructions": activated.instructions,
+        }
+        if self.config.skill_activation_observation == "explicit":
+            payload["next_action"] = (
+                "Activation only disclosed tools; it did not answer the user. "
+                "Call one available_tools function now before answering."
+            )
+        return (
+            json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+            ReActToolOutcome(disposition=ToolOutcomeDisposition.SUCCESS),
+            parsed.skill,
+        )
+
     def _build_success_response(
         self,
         answer: str,
@@ -638,6 +1021,7 @@ class ReActAgent(Agent[ReActAgentConfig]):
         trace: List[ReActStep],
         iterations: int,
         usage: Optional[CompletionUsage] = None,
+        termination_reason: str = "completed",
     ) -> ChatCompletionResponse:
         """
         Build a successful ChatCompletionResponse with react_trace in provider_specific_fields.
@@ -664,6 +1048,9 @@ class ReActAgent(Agent[ReActAgentConfig]):
                     provider_specific_fields={
                         "react_trace": [step.model_dump() for step in trace],
                         "iterations": iterations,
+                        "success": True,
+                        "termination_reason": termination_reason,
+                        "unresolved_tool_failures": [],
                     },
                 )
             ],
@@ -703,6 +1090,8 @@ class ReActAgent(Agent[ReActAgentConfig]):
                         "iterations": iterations,
                         "error": error_message,
                         "success": False,
+                        "termination_reason": "llm_error",
+                        "unresolved_tool_failures": [],
                     },
                 )
             ],
@@ -741,6 +1130,8 @@ class ReActAgent(Agent[ReActAgentConfig]):
                         "iterations": iterations,
                         "error": "Max iterations reached",
                         "success": False,
+                        "termination_reason": "max_iterations",
+                        "unresolved_tool_failures": [],
                     },
                 )
             ],
@@ -798,6 +1189,120 @@ class ReActAgent(Agent[ReActAgentConfig]):
             logger.error(f"LLM call failed: {e}", exc_info=True)
             return f"LLM call failed: {e}"
 
+    @staticmethod
+    def _structured_tool_error(code: str, message: str) -> str:
+        return json.dumps(
+            {"status": "error", "error": {"code": code, "message": message}},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _bounded_error(error: Exception, limit: int = 300) -> str:
+        message = " ".join(str(error).split())
+        return message if len(message) <= limit else f"{message[: limit - 3]}..."
+
+    @staticmethod
+    def _validation_error_message(error: Exception) -> str:
+        if not isinstance(error, ValidationError):
+            return f"Tool arguments failed validation: {ReActAgent._bounded_error(error)}"
+
+        issues = []
+        for detail in error.errors(include_input=False, include_url=False)[:3]:
+            location = ".".join(str(part) for part in detail.get("loc", ())) or "arguments"
+            issues.append(f"{location}: {detail.get('msg', 'invalid value')}")
+        return "Invalid tool arguments: " + "; ".join(issues)
+
+    @staticmethod
+    def _tool_call_fingerprint(tool_name: str, tool_args: dict) -> str:
+        canonical_args = json.dumps(tool_args, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+        return f"{tool_name}:{canonical_args}"
+
+    @staticmethod
+    def _record_failure_attempt(
+        attempts: dict[tuple[str, str], int],
+        tool_name: str,
+        outcome: ReActToolOutcome,
+    ) -> int:
+        key = (tool_name, outcome.code or outcome.disposition.value)
+        attempts[key] = attempts.get(key, 0) + 1
+        return attempts[key]
+
+    @staticmethod
+    def _failure_record(tool_name: str, outcome: ReActToolOutcome) -> dict[str, str]:
+        return {
+            "tool": tool_name,
+            "code": outcome.code or outcome.disposition.value,
+            "message": outcome.message or "The tool could not complete this part of the request.",
+            "disposition": outcome.disposition.value,
+        }
+
+    @classmethod
+    def _append_failure(
+        cls,
+        failures: list[dict[str, str]],
+        tool_name: str,
+        outcome: ReActToolOutcome,
+    ) -> None:
+        record = cls._failure_record(tool_name, outcome)
+        for index, existing in enumerate(failures):
+            if existing["tool"] == record["tool"] and existing["code"] == record["code"]:
+                failures[index] = record
+                return
+        failures.append(record)
+
+    @staticmethod
+    def _resolve_latest_failure(failures: list[dict[str, str]], tool_name: str) -> None:
+        for index in range(len(failures) - 1, -1, -1):
+            if failures[index]["tool"] == tool_name:
+                del failures[index]
+                return
+
+    def _build_policy_response(
+        self,
+        start_time: int,
+        trace: List[ReActStep],
+        iterations: int,
+        usage: CompletionUsage,
+        termination_reason: str,
+        verified_results: list[dict[str, str]],
+        unresolved_failures: list[dict[str, str]],
+    ) -> ChatCompletionResponse:
+        lines: list[str] = []
+        if verified_results:
+            lines.append("Verified results:")
+            lines.extend(f"- {item['tool']}: {item['summary']}" for item in verified_results)
+        if unresolved_failures:
+            if lines:
+                lines.append("")
+            heading = "Clarification needed:" if termination_reason == "clarification_required" else "Unresolved:"
+            lines.append(heading)
+            lines.extend(f"- {item['tool']}: {item['message']}" for item in unresolved_failures)
+        if not lines:
+            lines.append("The tool workflow stopped because it made no further progress.")
+
+        success = bool(verified_results) and not unresolved_failures
+        return ChatCompletionResponse(
+            id=f"react-{uuid.uuid4().hex[:12]}",
+            created=start_time,
+            model=str(self.config.model),
+            choices=[
+                Choice(
+                    index=0,
+                    message=AssistantMessage(content="\n".join(lines)),
+                    finish_reason=FinishReason.stop,
+                    provider_specific_fields={
+                        "react_trace": [step.model_dump() for step in trace],
+                        "iterations": iterations,
+                        "success": success,
+                        "termination_reason": termination_reason,
+                        "unresolved_tool_failures": unresolved_failures,
+                    },
+                )
+            ],
+            usage=usage if usage.total_tokens > 0 else None,
+        )
+
     def _execute_tool_with_wrappers(
         self,
         ctx: ProcessContext,
@@ -805,7 +1310,7 @@ class ReActAgent(Agent[ReActAgentConfig]):
         tool_args: dict,
         toolset: ReActToolset,
         thought: Optional[str] = None,
-    ) -> tuple[str, list]:
+    ) -> tuple[str, list, Optional[ReActToolOutcome]]:
         """
         Execute a tool with the wrapper pipeline.
 
@@ -829,13 +1334,31 @@ class ReActAgent(Agent[ReActAgentConfig]):
         # Get tool spec
         toolspec = toolset.get_toolspec(tool_name)
         if not toolspec:
-            return f"Error: Unknown tool '{tool_name}'", plugin_messages
+            message = f"Unknown tool '{tool_name}'."
+            return (
+                self._structured_tool_error("unknown_tool", message),
+                plugin_messages,
+                ReActToolOutcome(
+                    disposition=ToolOutcomeDisposition.RETRYABLE_ERROR,
+                    code="unknown_tool",
+                    message=message,
+                ),
+            )
 
         # Parse arguments into BaseModel
         try:
             parsed_args = toolspec.parse_args(tool_args)
         except Exception as e:
-            return f"Error parsing tool arguments: {e}", plugin_messages
+            message = self._validation_error_message(e)
+            return (
+                self._structured_tool_error("invalid_arguments", message),
+                plugin_messages,
+                ReActToolOutcome(
+                    disposition=ToolOutcomeDisposition.RETRYABLE_ERROR,
+                    code="invalid_arguments",
+                    message="Tool arguments failed validation.",
+                ),
+            )
 
         # Run preprocess on all wrappers
         current_args = parsed_args
@@ -851,7 +1374,14 @@ class ReActAgent(Agent[ReActAgentConfig]):
                     # Wrapper wants to skip execution
                     tool_output = result.output
                     # Still run postprocessors with the skipped result
-                    return self._run_tool_postprocessors(ctx, tool_name, current_args, tool_output, plugin_messages)
+                    tool_output, plugin_messages = self._run_tool_postprocessors(
+                        ctx, tool_name, current_args, tool_output, plugin_messages
+                    )
+                    return (
+                        tool_output,
+                        plugin_messages,
+                        toolset.interpret_result(tool_name, current_args, tool_output),
+                    )
                 else:
                     # Continue with modified args
                     current_args = result
@@ -869,10 +1399,26 @@ class ReActAgent(Agent[ReActAgentConfig]):
             if handled_output is not None:
                 tool_output = handled_output
             else:
-                tool_output = f"Error executing tool: {e}"
+                message = f"Tool execution failed: {self._bounded_error(e)}"
+                tool_output = self._structured_tool_error("execution_error", message)
+                tool_output, plugin_messages = self._run_tool_postprocessors(
+                    ctx, tool_name, current_args, tool_output, plugin_messages
+                )
+                return (
+                    tool_output,
+                    plugin_messages,
+                    ReActToolOutcome(
+                        disposition=ToolOutcomeDisposition.TERMINAL_ERROR,
+                        code="execution_error",
+                        message="The tool failed during execution.",
+                    ),
+                )
 
         # Run postprocessors
-        return self._run_tool_postprocessors(ctx, tool_name, current_args, tool_output, plugin_messages)
+        tool_output, plugin_messages = self._run_tool_postprocessors(
+            ctx, tool_name, current_args, tool_output, plugin_messages
+        )
+        return tool_output, plugin_messages, toolset.interpret_result(tool_name, current_args, tool_output)
 
     def _run_tool_postprocessors(
         self,

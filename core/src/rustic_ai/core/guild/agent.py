@@ -7,7 +7,7 @@ import inspect
 import logging
 from queue import Queue
 import threading
-from typing import Any, Callable, Dict, Generic, List, Optional, Type, TypeVar
+from typing import Any, Callable, Dict, Generic, List, Optional, Type, TypeVar, get_type_hints
 
 from pydantic import BaseModel, Field
 
@@ -1064,6 +1064,18 @@ def processor(
         deps: List[AgentDependency] = [
             dep if isinstance(dep, AgentDependency) else AgentDependency.from_string(dep) for dep in depends_on
         ]
+
+        try:
+            type_hints = get_type_hints(func)
+        except (NameError, TypeError):
+            type_hints = func.__annotations__
+
+        for dep in deps:
+            if dep.required_type:
+                continue
+            dependency_type = type_hints.get(dep.variable_name)
+            if dependency_type is not None and not isinstance(dependency_type, str):
+                dep.required_type = f"{dependency_type.__module__}.{dependency_type.__qualname__}"
 
         def wrapper(self: AT, msg: Message) -> None:
 

@@ -10,7 +10,7 @@
       {
         "name": "Research Manager",
         "description": "A manager for the research process",
-        "class_name": "rustic_ai.showcase.laira.research_manager.ResearchManager",
+        "class_name": "rustic_ai.research_manager.agent.ResearchManager",
         "additional_topics": [],
         "properties": {
           "serp_results": 5,

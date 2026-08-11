@@ -33,6 +33,7 @@ flowchart TD
 - **ReActAgent**: Main agent class that runs the ReAct loop
 - **ReActAgentConfig**: Configuration including model, toolset, and plugin settings
 - **ReActToolset**: Abstract base class defining tool specifications and execution
+- **ReActSkillSpec**: Optional metadata for progressively disclosing related tools
 - **ReActStep**: Model representing a single reasoning step (stored in trace)
 
 ## Basic Usage
@@ -40,41 +41,15 @@ flowchart TD
 ### Simple ReActAgent
 
 ```python
-from typing import List
-
-from pydantic import BaseModel, Field
 from rustic_ai.core.guild.agent_ext.depends.dependency_resolver import DependencySpec
 from rustic_ai.core.guild.agent_ext.depends.llm.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     UserMessage,
 )
-from rustic_ai.core.guild.agent_ext.depends.llm.tools_manager import ToolSpec
 from rustic_ai.core.guild.builders import AgentBuilder
-from rustic_ai.llm_agent.react import ReActAgent, ReActAgentConfig, ReActToolset
+from rustic_ai.llm_agent.react import MathToolset, ReActAgent, ReActAgentConfig
 from rustic_ai.testing.helpers import wrap_agent_for_testing
-
-
-# Define parameter model
-class CalculateParams(BaseModel):
-    expression: str = Field(description="Mathematical expression to evaluate")
-
-
-# Define a custom toolset
-class CalculatorToolset(ReActToolset):
-    def get_toolspecs(self) -> List[ToolSpec]:
-        return [
-            ToolSpec(
-                name="calculate",
-                description="Evaluate a mathematical expression",
-                parameter_class=CalculateParams
-            )
-        ]
-    
-    def execute(self, tool_name: str, args: BaseModel) -> str:
-        if tool_name == "calculate":
-            return str(eval(args.expression))
-        raise ValueError(f"Unknown tool: {tool_name}")
 
 
 # Build agent spec
@@ -87,7 +62,7 @@ agent_spec = (
         ReActAgentConfig(
             model="gpt-5-nano",
             max_iterations=10,
-            toolset=CalculatorToolset(),
+            toolset=MathToolset(),
         )
     )
     .build_spec()
@@ -157,6 +132,11 @@ properties:
 | `system_prompt` | `str` | Default ReAct prompt | Custom system prompt |
 | `temperature` | `float` | `None` | Sampling temperature (0.0-2.0) |
 | `max_tokens` | `int` | `None` | Max tokens per LLM response |
+| `tool_disclosure` | `all \| skills` | `all` | Expose every tool immediately or select skill groups first |
+| `skill_activation_followup` | `auto \| required` | `auto` | Let the model choose its next action or require a disclosed domain tool immediately after activation |
+| `skill_activation_observation` | `standard \| explicit` | `standard` | Optionally state explicitly that activation did not answer the request |
+| `skill_disclosure_progression` | `sticky \| expand_after_first_success` | `sticky` | Keep only activated groups visible or expose the full catalog after the first successful domain action |
+| `failure_handling` | `safe \| legacy` | `safe` | Apply interpreted-result safety and bounded recovery or preserve the unrestricted historical loop |
 | `base_url` | `str` | `None` | Custom LLM API base URL |
 | `timeout` | `float` | `None` | Request timeout in seconds |
 
@@ -267,6 +247,145 @@ config = ReActAgentConfig(
 )
 ```
 
+### DuckDuckGo Instant Answers
+
+`rusticai-llm-agent` includes an opt-in toolset for factual Instant Answer lookups:
+
+```yaml
+properties:
+  toolset:
+    kind: rustic_ai.llm_agent.react.toolsets.duckduckgo.DuckDuckGoInstantAnswerToolset
+    timeout_seconds: 10
+```
+
+The `duckduckgo_instant_answer` tool returns bounded JSON containing an answer,
+abstract, definition, and related topics when available. It is not a general web
+search API and explicitly reports when no Instant Answer exists. Sandboxed agents
+must be granted egress to `api.duckduckgo.com`; defining the toolset does not grant
+network access by itself.
+
+Use concise entity or topic queries such as `France`, `Python (programming
+language)`, or `Nineteen Eighty-Four`, rather than natural-language questions.
+Safe failure handling permits one meaningfully different retry and will not
+present model memory as a verified fact after `no_result`.
+
+### MediaWiki search
+
+`MediaWikiSearchToolset` provides key-free, bounded search over English
+Wikipedia for stable encyclopedic facts:
+
+```yaml
+properties:
+  toolset:
+    kind: rustic_ai.llm_agent.react.toolsets.mediawiki.MediaWikiSearchToolset
+    timeout_seconds: 10
+```
+
+The `mediawiki_search` tool performs one fixed-host MediaWiki request that
+returns ranked article titles, plain-text introductory extracts, canonical
+URLs, and disambiguation markers. Results are attributed to English Wikipedia.
+The tool reports `ambiguous` when the top article is a disambiguation page, so
+safe failure handling asks the user to select a meaning rather than guessing.
+
+This is an encyclopedia lookup, not general web search. It should not be used
+for current events, live data, shopping, or information outside Wikipedia.
+Sandboxed agents need egress only to `en.wikipedia.org`.
+
+Combine the built-in lookup and offline tools when an agent needs all four:
+
+```yaml
+properties:
+  toolset:
+    kind: rustic_ai.llm_agent.react.toolset.CompositeToolset
+    toolsets:
+      - kind: rustic_ai.llm_agent.react.toolsets.math.MathToolset
+      - kind: rustic_ai.llm_agent.react.toolsets.temporal.TemporalToolset
+      - kind: rustic_ai.llm_agent.react.toolsets.mediawiki.MediaWikiSearchToolset
+      - kind: rustic_ai.llm_agent.react.toolsets.duckduckgo.DuckDuckGoInstantAnswerToolset
+```
+
+### Deterministic math and unit conversion
+
+`MathToolset` provides offline arithmetic and physical-unit conversion without
+evaluating Python code:
+
+```yaml
+properties:
+  toolset:
+    kind: rustic_ai.llm_agent.react.toolsets.math.MathToolset
+```
+
+The `calculate` tool accepts a restricted arithmetic expression, including
+`sum`, `mean`, `median`, `floor`, and `ceil`. Percentages must be explicit
+arithmetic, such as `(150 - 120) / 120 * 100`. The `convert_units` tool accepts
+a value plus compatible source and target units. Its schema advertises canonical
+unit IDs to constrain model choices while runtime validation remains compatible
+with documented aliases. US and Imperial volume units must be identified
+explicitly.
+
+### Deterministic date and time
+
+`TemporalToolset` provides offline current-time, timezone conversion, calendar
+arithmetic, weekday, and Monday-to-Friday business-day operations:
+
+```yaml
+properties:
+  toolset:
+    kind: rustic_ai.llm_agent.react.toolsets.temporal.TemporalToolset
+```
+
+Timezone arguments use IANA names such as `America/Vancouver`; when omitted,
+the toolset discovers the operating system timezone. Date inputs use
+`YYYY-MM-DD`, datetime inputs use ISO format, and business-day calculations do
+not include jurisdictional holidays. Ambiguous or nonexistent daylight-saving
+wall times return a clarification request instead of choosing an offset.
+
+`ReActAgentConfig.failure_handling` defaults to `safe`. Safe mode interprets
+built-in structured results, suppresses duplicate execution, permits one
+corrective retry, returns clarification for ambiguous units, and preserves
+verified partial results. Set it to `legacy` only when unrestricted historical
+loop behavior is required. Custom toolsets remain opaque unless they implement
+the optional `interpret_result` hook.
+
+### Progressive Tool Disclosure
+
+`tool_disclosure="skills"` is opt-in. A toolset may return lightweight
+`ReActSkillSpec` records from `get_skill_specs()`. The agent initially exposes a
+single `activate_tool_skill` meta-tool. Each call activates exactly one skill and
+adds that skill's tools to later model rounds. The selector remains available,
+so another skill can be activated only when a later step needs it; the model is
+not required to predict the complete skill set upfront. Several independent
+singular activations may be requested in one response. Domain tools emitted
+before they have appeared in a model request are rejected without execution.
+The ordinary `max_iterations` setting is the only expansion bound.
+
+The built-in groups are `math_and_units`, `dates_and_time`, and
+`knowledge_lookup`. MediaWiki and DuckDuckGo contribute separate tools to the
+shared lookup group. `CompositeToolset` merges same-name groups only when their
+descriptions agree, applies explicit disclosure ordering, and rejects conflicting
+groups, tools claimed by the wrong child, or partial metadata that would leave
+tools permanently hidden. Toolsets with no skill metadata retain the existing
+all-tools behavior even when skill mode is requested.
+
+```python
+config = ReActAgentConfig(
+    model="local/small-model",
+    toolset=CompositeToolset(toolsets=[MathToolset(), TemporalToolset()]),
+    tool_disclosure="skills",
+    skill_activation_observation="explicit",
+    skill_disclosure_progression="expand_after_first_success",
+)
+```
+
+`expand_after_first_success` preserves a small first routing decision but avoids
+requiring the model to predict every later skill in a multi-tool workflow. The
+default `sticky` mode keeps disclosure scoped for applications where minimizing
+the visible tool surface is more important.
+
+Custom `system_prompt` remains a full replacement. The selector's description
+contains the complete incremental-disclosure contract, so replacement prompts do
+not need to duplicate it.
+
 Or in YAML:
 
 ```yaml
@@ -274,7 +393,7 @@ properties:
   toolset:
     kind: rustic_ai.llm_agent.react.toolset.CompositeToolset
     toolsets:
-      - kind: my_package.CalculatorToolset
+      - kind: rustic_ai.llm_agent.react.toolsets.math.MathToolset
       - kind: my_package.SearchToolset
         api_key: ${SEARCH_API_KEY}
       - kind: my_package.WeatherToolset
@@ -549,6 +668,7 @@ assert len(trace) == expected_iterations
 - `ReActStep` - Reasoning step model
 - `ReActToolset` - Abstract toolset base class
 - `CompositeToolset` - Combine multiple toolsets
+- `ReActSkillSpec` - Progressive-disclosure metadata
 
 **Constants:**
 - `DEFAULT_REACT_SYSTEM_PROMPT` - Default ReAct system prompt

@@ -21,6 +21,8 @@ packages = [{ include = "rustic_ai", from = "src" }]
 [tool.poetry.dependencies]
 rusticai-core = { path = "../core", develop = true }
 openai = "^2.46.0"
+tzlocal = "^5.4.4"
+tzdata = "^2026.3"
 
 [tool.poetry-monorepo.deps]
 
@@ -74,4 +76,3 @@ lines_between_sections = 1 # For the newline issue
 known_third_party = ["pydantic", "fastapi", "starlette", "uvicorn", "ray", "dotenv", "openai", "litellm", "pytest", "playwright", "redis", "serpapi", "vertexai"]
 known_first_party = ["rustic_ai"]
 known_local_folder = ["core", "rustic_ai.testing"]
-

@@ -22,10 +22,10 @@ class InMemoryKVStore(BaseKVStore):
         del self.store[key]
 
 
-class InMemoryKVStoreResolver(DependencyResolver[InMemoryKVStore]):
+class InMemoryKVStoreResolver(DependencyResolver[BaseKVStore]):
 
     def __init__(self) -> None:
         super().__init__()
 
-    def resolve(self, org_id: str, guild_id: str, agent_id: str) -> InMemoryKVStore:
+    def resolve(self, org_id: str, guild_id: str, agent_id: str) -> BaseKVStore:
         return InMemoryKVStore()

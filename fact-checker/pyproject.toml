@@ -1,0 +1,42 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "rusticai-fact-checker"
+version = "1.4.0"
+description = "Fact-checking agent for Rustic AI guilds"
+authors = [{name = "Dragonscale Industries Inc.", email = "dev@dragonscale.ai"}]
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dynamic = ["dependencies"]
+urls = { Homepage = "https://www.rustic.ai/", Repository = "https://github.com/rustic-ai/rustic-ai", "Rustic AI Core" = "https://pypi.org/project/rusticai-core/" }
+
+[tool.poetry]
+packages = [{ include = "rustic_ai", from = "src" }]
+
+[tool.poetry.dependencies]
+rusticai-core = { path = "../core", develop = true }
+google-api-python-client = "^2.198.0"
+spacy = "^3.8.14"
+spacytextblob = "^5.1.0"
+
+[tool.poetry-monorepo.deps]
+
+[tool.poetry.group.dev]
+optional = true
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.1.1"
+rusticai-testing = { path = "../testing", develop = true }
+
+[tool.poetry.extras]
+test = ["pytest", "rusticai-testing"]
+
+[tool.black]
+line-length = 120
+target-version = ["py313"]
+
+[tool.isort]
+profile = "black"

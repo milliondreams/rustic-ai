@@ -38,11 +38,12 @@ class TestGuildMessages:
     def test_message_broadcast(self, messaging: MessagingConfig, database, org_id):
         builder = GuildBuilder(
             guild_name="test_message_broadcast", guild_description="guild to test broadcast messages"
-        ).set_messaging(
+        )
+        builder.set_messaging(
             messaging.backend_module,
             messaging.backend_class,
             messaging.backend_config,
-        )
+        ).set_property("conversation_history_size", 10)
 
         guild = builder.bootstrap(database, org_id)
 
@@ -187,6 +188,7 @@ class TestGuildMessages:
 
         assert default_topic_message.payload["message"] == "Hello, world!"
         assert default_topic_message.sender.id == UserProxyAgent.get_user_agent_id(user1)
+        assert default_topic_message.enrich_with_history == 10
 
         def is_user_notification(message: Message) -> bool:
             if isinstance(message.topics, str) and message.topics.startswith("user_notifications"):

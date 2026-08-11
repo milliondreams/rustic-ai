@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from enum import Enum
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -11,6 +12,43 @@ from rustic_ai.core.utils.basic_class_utils import get_class_from_name
 if TYPE_CHECKING:
     from rustic_ai.llm_agent.plugins.request_preprocessor import RequestPreprocessor
     from rustic_ai.llm_agent.plugins.tool_call_wrapper import ToolCallWrapper
+
+
+class ToolOutcomeDisposition(str, Enum):
+    """How the ReAct executor should handle an interpreted tool result."""
+
+    SUCCESS = "success"
+    RETRYABLE_ERROR = "retryable_error"
+    TERMINAL_ERROR = "terminal_error"
+    CLARIFICATION_REQUIRED = "clarification_required"
+    NO_RESULT = "no_result"
+
+
+class ReActToolOutcome(BaseModel):
+    """Structured interpretation of a tool's string result."""
+
+    disposition: ToolOutcomeDisposition
+    code: Optional[str] = None
+    message: Optional[str] = None
+    verified_summary: Optional[str] = None
+
+
+class ReActSkillSpec(BaseModel):
+    """A progressively disclosed group of related ReAct tools."""
+
+    name: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    description: str = Field(min_length=1, max_length=500)
+    tool_names: List[str] = Field(min_length=1)
+    instructions: str = Field(default="", max_length=2_000)
+    examples: List[str] = Field(default_factory=list, max_length=8)
+    order: int = Field(default=100, ge=0, exclude=True)
+
+    @field_validator("tool_names")
+    @classmethod
+    def _unique_tool_names(cls, value: List[str]) -> List[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("skill tool_names must be unique")
+        return value
 
 
 class ReActToolset(BaseModel, ABC):
@@ -27,28 +65,19 @@ class ReActToolset(BaseModel, ABC):
     The toolset is fully serializable via the `kind` field which stores the
     fully qualified class name (FQCN) for runtime class resolution.
 
-    Example:
-        class CalculatorToolset(ReActToolset):
-            def get_toolspecs(self) -> List[ToolSpec]:
-                return [
-                    ToolSpec(
-                        name="calculate",
-                        description="Evaluate a math expression",
-                        parameter_class=CalculateParams
-                    )
-                ]
-
-            def execute(self, tool_name: str, args: BaseModel) -> str:
-                if tool_name == "calculate":
-                    return str(eval(args.expression))
-                raise ValueError(f"Unknown tool: {tool_name}")
+    Built-in implementations such as ``MathToolset`` provide safe tools that can
+    be used directly or combined with ``CompositeToolset``.
     """
 
     kind: Optional[str] = Field(default=None, frozen=True, description="FQCN of the toolset class")
 
     def model_post_init(self, __context) -> None:
         if not self.kind:
-            object.__setattr__(self, "kind", f"{self.__class__.__module__}.{self.__class__.__qualname__}")
+            object.__setattr__(
+                self,
+                "kind",
+                f"{self.__class__.__module__}.{self.__class__.__qualname__}",
+            )
 
     @model_validator(mode="after")
     def _enforce_kind_matches_class(self):
@@ -121,6 +150,18 @@ class ReActToolset(BaseModel, ABC):
             ValueError: If required plugins are not configured.
         """
         pass
+
+    def interpret_result(self, tool_name: str, args: BaseModel, result: str) -> Optional[ReActToolOutcome]:
+        """Interpret a result for safe retry and failure handling.
+
+        Custom toolsets remain opaque by default. Implementations should only
+        return an outcome when they own and understand the result contract.
+        """
+        return None
+
+    def get_skill_specs(self) -> List[ReActSkillSpec]:
+        """Return optional progressive-disclosure metadata for this toolset."""
+        return []
 
     @cached_property
     def toolspecs_by_name(self) -> Dict[str, ToolSpec]:
@@ -239,6 +280,37 @@ class CompositeToolset(ReActToolset):
             specs.extend(toolset.get_toolspecs())
         return specs
 
+    def get_skill_specs(self) -> List[ReActSkillSpec]:
+        """Return child skills, merging explicitly compatible shared groups."""
+        contributions: Dict[str, List[ReActSkillSpec]] = {}
+        for toolset in self.toolsets:
+            owned_tools = set(toolset.tool_names)
+            for skill in toolset.get_skill_specs():
+                unknown = set(skill.tool_names) - owned_tools
+                if unknown:
+                    raise ValueError(
+                        f"Skill {skill.name!r} references tools not owned by its toolset: {sorted(unknown)}"
+                    )
+                existing = contributions.setdefault(skill.name, [])
+                if existing and existing[0].description != skill.description:
+                    raise ValueError(f"ReAct skill {skill.name!r} has conflicting descriptions across child toolsets")
+                existing.append(skill)
+
+        skills: List[ReActSkillSpec] = []
+        for name, parts in contributions.items():
+            ordered = sorted(enumerate(parts), key=lambda item: (item[1].order, item[0]))
+            skills.append(
+                ReActSkillSpec(
+                    name=name,
+                    description=parts[0].description,
+                    tool_names=[tool for _, part in ordered for tool in part.tool_names],
+                    instructions=" ".join(dict.fromkeys(part.instructions for _, part in ordered if part.instructions)),
+                    examples=list(dict.fromkeys(example for _, part in ordered for example in part.examples)),
+                    order=min(part.order for part in parts),
+                )
+            )
+        return sorted(skills, key=lambda skill: skill.order)
+
     def execute(self, tool_name: str, args: BaseModel) -> str:
         """
         Execute a tool by delegating to the appropriate child toolset.
@@ -269,6 +341,13 @@ class CompositeToolset(ReActToolset):
         """
         for toolset in self.toolsets:
             toolset.bind_agent_context(org_id, guild_id, agent_id)
+
+    def interpret_result(self, tool_name: str, args: BaseModel, result: str) -> Optional[ReActToolOutcome]:
+        """Delegate result interpretation to the toolset that owns the tool."""
+        for toolset in self.toolsets:
+            if tool_name in toolset.tool_names:
+                return toolset.interpret_result(tool_name, args, result)
+        return None
 
     def validate_plugins(
         self,

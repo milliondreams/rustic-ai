@@ -29,10 +29,7 @@ rusticai-vertexai = { path = "../vertexai", develop = true }
 rusticai-llm-agent = { path = "../llm-agent", develop = true }
 rusticai-pandas-analyst = { path = "../pandas-analyst", develop = true }
 rusticai-uniko-agent = {path = "../uniko-agent", develop = true}
-google-api-python-client = "^2.198.0"
 arxiv = "^4.0.0"
-spacytextblob = "^5.1.0"
-spacy = "^3.8.14"
 
 [tool.poetry-monorepo.deps]
 
@@ -48,6 +45,12 @@ tox = "^4.57.1"
 isort = "^8.0.1"
 mypy = "^2.3.0"
 pytest-asyncio = "^1.4.0"
+rusticai-research-manager = {path = "../research-manager", develop = true}
+
+[[tool.poetry.source]]
+name = "uniko"
+url = "https://rustic-ai.github.io/uniko/packages/"
+priority = "explicit"
 
 [tool.poetry.extras]
 test = ["pytest"]

@@ -3,7 +3,7 @@ from typing import List, Optional, Tuple
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import spacy
 from spacytextblob.spacytextblob import SpacyTextBlob  # noqa: F401
 
@@ -31,7 +31,7 @@ class Claim(BaseModel):
     text: str
     claimant: Optional[str] = None
     claimDate: Optional[str] = None
-    claimReview: List[ClaimReview] = []
+    claimReview: List[ClaimReview] = Field(default_factory=list)
 
 
 class ClaimsResponse(BaseModel):
@@ -39,7 +39,7 @@ class ClaimsResponse(BaseModel):
     nextPageToken: Optional[str] = None
 
 
-class FactCheckRespones(BaseModel):
+class FactCheckResponse(BaseModel):
     query: str
     claims: List[Claim]
     nextPageToken: Optional[str] = None
@@ -51,9 +51,14 @@ class FactCheckerAgent(Agent):
         if self._key:
             self.service = build("factchecktools", "v1alpha1", developerKey=self._key)
         else:
-            self.service = build("factchecktools", "v1alpha1")
+            # Local guilds should still launch when Google Fact Check is not configured.
+            self.service = None
 
-        self.nlp = spacy.load("en_core_web_sm")
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            # The optional language model is not distributed with this package.
+            self.nlp = spacy.blank("en")
         if "spacytextblob" not in self.nlp.pipe_names:
             self.nlp.add_pipe("spacytextblob", last=True)
 
@@ -189,6 +194,8 @@ class FactCheckerAgent(Agent):
         return final_verdict, top_urls
 
     def get_claims(self, query):
+        if self.service is None:
+            return None
         try:
             response = self.service.claims().search(query=query, languageCode="en-US", alt="json").execute()
             if response:
@@ -229,7 +236,7 @@ class FactCheckerAgent(Agent):
 
             ctx.send(TextFormat(text=response))
             ctx.send(
-                FactCheckRespones(
+                FactCheckResponse(
                     query=query, claims=claims_response.claims, nextPageToken=claims_response.nextPageToken
                 )
             )

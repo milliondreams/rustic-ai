@@ -4,7 +4,7 @@ import logging
 import re
 from typing import Dict, List
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import pydantic_core
 
 from rustic_ai.core import Message, Priority
@@ -30,6 +30,7 @@ from rustic_ai.core.guild.dsl import GuildSpec, GuildTopics
 from rustic_ai.core.messaging.core.message import (
     AgentTag,
     ForwardHeader,
+    FunctionalTransformer,
     JsonDict,
     RoutingDestination,
     RoutingRule,
@@ -54,6 +55,7 @@ class ParticipantListRequest(BaseModel):
 
 class UserProxyAgentProps(BaseAgentProps):
     user_id: str
+    conversation_history_size: int = Field(default=0, ge=0)
 
 
 def user_topic_filter(upa: "UserProxyAgent", message: Message) -> bool:
@@ -150,6 +152,12 @@ class UserProxyAgent(Agent[UserProxyAgentProps], GuildRefreshMixin):
                 recipient_list=unwrapped_message.recipient_list + tagged_users,
             ),
         )
+
+        history_size = self.config.conversation_history_size
+        if history_size > 0:
+            routing_entry.transformer = FunctionalTransformer(
+                handler=json.dumps({"enrich_with_history": history_size})
+            )
 
         ctx.add_routing_step(routing_entry)
 

@@ -46,6 +46,16 @@ class TestSkillToolset:
         assert "test_skill_process" in names
         assert "test_skill_setup" in names
 
+    def test_get_skill_specs_for_progressive_disclosure(self, sample_skill_dir):
+        toolset = SkillToolset.from_path(sample_skill_dir)
+
+        skills = toolset.get_skill_specs()
+
+        assert len(skills) == 1
+        assert skills[0].name == "test-skill"
+        assert skills[0].tool_names == ["test_skill_process", "test_skill_setup"]
+        assert skills[0].instructions
+
     def test_get_toolspecs_no_prefix(self, sample_skill_dir):
         """Test getting tool specs without prefix."""
         toolset = SkillToolset.from_path(sample_skill_dir, tool_prefix="")

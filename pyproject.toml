@@ -30,6 +30,8 @@ torch = [ # Adding torch dependency explicitly to avoid issues on macOS
 rusticai-huggingface = { path = "./huggingface", develop = true }
 rusticai-langchain = { path = "./langchain", develop = true }
 rusticai-showcase = { path = "./showcase", develop = true }
+rusticai-fact-checker = { path = "./fact-checker", develop = true }
+rusticai-research-manager = { path = "./research-manager", develop = true }
 # Optional dependencies for additional functionality during runtime
 gcsfs = { version = "^2026.4.0", optional = true }
 rusticai-vertexai = { path = "./vertexai", develop = true }

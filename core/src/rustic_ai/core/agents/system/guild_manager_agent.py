@@ -713,7 +713,14 @@ class GuildManagerAgent(Agent[GuildManagerAgentProps]):
                 .set_id(UserProxyAgent.get_user_agent_id(user_id))
                 .set_name(uacr.user_name)
                 .set_description(f"Agent for user {user_id}")
-                .set_properties(UserProxyAgentProps(user_id=user_id))
+                .set_properties(
+                    UserProxyAgentProps(
+                        user_id=user_id,
+                        conversation_history_size=self.guild_spec.properties.get(
+                            "conversation_history_size", 0
+                        ),
+                    )
+                )
                 .add_additional_topic(UserProxyAgent.get_user_inbox_topic(user_id))
                 .add_additional_topic(UserProxyAgent.get_user_outbox_topic(user_id))
                 .add_additional_topic(UserProxyAgent.get_user_system_notifications_topic(user_id))

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "rusticai-research-manager"
+version = "1.4.0"
+description = "Research workflow manager agent for Rustic AI guilds"
+authors = [{name = "Dragonscale Industries Inc.", email = "dev@dragonscale.ai"}]
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dynamic = ["dependencies"]
+urls = { Homepage = "https://www.rustic.ai/", Repository = "https://github.com/rustic-ai/rustic-ai", "Rustic AI Core" = "https://pypi.org/project/rusticai-core/" }
+
+[tool.poetry]
+packages = [{ include = "rustic_ai", from = "src" }]
+
+[tool.poetry.dependencies]
+rusticai-core = { path = "../core", develop = true }
+rusticai-playwright = { path = "../playwright", develop = true }
+rusticai-serpapi = { path = "../serpapi", develop = true }
+shortuuid = "^1.0.13"
+
+[tool.poetry-monorepo.deps]
+
+[tool.poetry.group.dev]
+optional = true
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.1.1"
+rusticai-testing = { path = "../testing", develop = true }
+
+[tool.poetry.extras]
+test = ["pytest", "rusticai-testing"]
+
+[tool.black]
+line-length = 120
+target-version = ["py313"]
+
+[tool.isort]
+profile = "black"
