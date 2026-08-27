@@ -169,7 +169,7 @@ sh -c '
             CPU_COUNT=1
         fi
 
-        if [ "$CPU_COUNT" -gt 4 ]; then
+        if [ "$CPU_COUNT" -gt 2 ]; then
             WORKERS=$((CPU_COUNT - 2))
 
             # Importing the complete monorepo test graph takes substantial memory
@@ -210,7 +210,7 @@ sh -c '
                 PARALLEL=0
             fi
         else
-            printf "ℹ️  Only %d cores detected (<= 4). Disabling parallel execution.\n" "$CPU_COUNT"
+            printf "ℹ️  Only %d cores detected (<= 2). Disabling parallel execution.\n" "$CPU_COUNT"
             PARALLEL=0
         fi
     fi
