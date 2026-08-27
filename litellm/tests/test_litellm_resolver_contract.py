@@ -1,3 +1,5 @@
+"""Contract tests for the LiteLLM dependency resolver."""
+
 from typing import get_args, get_origin
 
 from rustic_ai.core.guild.agent_ext.depends import DependencyResolver

@@ -49,6 +49,11 @@ RUN scripts/poetry_install.sh
 
 RUN scripts/poetry_build.sh
 
+# poetry_build.sh installs each module into the shared virtualenv while building.
+# Restore the root lock before copying that environment into the runtime image.
+RUN poetry install --without dev --all-extras \
+    && ${VIRTUAL_ENV}/bin/pip check
+
 
 # The runtime image, used to just run the code provided its virtual environment
 FROM base AS final
@@ -58,7 +63,8 @@ COPY --from=builder ${VIRTUAL_ENV} ${VIRTUAL_ENV}
 COPY --from=builder ${APPDIR}/dist/*.whl ${APPDIR}/dist/
 COPY conf ${APPDIR}/conf
 
-RUN ${VIRTUAL_ENV}/bin/pip install ${APPDIR}/dist/*.whl
+RUN ${VIRTUAL_ENV}/bin/pip install --no-deps ${APPDIR}/dist/*.whl \
+    && ${VIRTUAL_ENV}/bin/pip check
 
 RUN rm -rf ${APPDIR}/dist
 

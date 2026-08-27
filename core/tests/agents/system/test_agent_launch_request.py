@@ -1,5 +1,5 @@
-import pytest
 from pydantic import ValidationError
+import pytest
 
 from rustic_ai.core.agents.system.models import AgentLaunchRequest
 from rustic_ai.core.guild import AgentSpec
@@ -18,9 +18,7 @@ def agent_spec() -> AgentSpec:
 def test_agent_launch_request_accepts_dependency_selections():
     request = AgentLaunchRequest(
         agent_spec=agent_spec(),
-        dependency_selections={
-            "llm": {"catalog_key": "dynamic_models", "selector": "gpt"}
-        },
+        dependency_selections={"llm": {"catalog_key": "dynamic_models", "selector": "gpt"}},
     )
 
     assert request.dependency_selections["llm"].selector == "gpt"

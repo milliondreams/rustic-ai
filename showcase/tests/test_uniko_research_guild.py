@@ -145,7 +145,9 @@ class TestUnikoResearchGuildConfiguration:
             (
                 step
                 for step in guild_spec.routes.steps
-                if step.agent and step.agent.name == "Search Agent" and step.message_format == "rustic_ai.serpapi.agent.SERPResults"
+                if step.agent
+                and step.agent.name == "Search Agent"
+                and step.message_format == "rustic_ai.serpapi.agent.SERPResults"
             ),
             None,
         )
@@ -156,11 +158,7 @@ class TestUnikoResearchGuildConfiguration:
     def test_playwright_to_memory_routing(self, guild_spec: GuildSpec):
         """Test routing from Playwright to Memory."""
         playwright_route = next(
-            (
-                step
-                for step in guild_spec.routes.steps
-                if step.agent and step.agent.name == "Web Scraper Agent"
-            ),
+            (step for step in guild_spec.routes.steps if step.agent and step.agent.name == "Web Scraper Agent"),
             None,
         )
         assert playwright_route is not None, "Playwright Agent routing not found"
@@ -170,7 +168,8 @@ class TestUnikoResearchGuildConfiguration:
         """Test synthesis agent routes exist and are complete."""
         # Route TO synthesis
         to_synthesis = any(
-            "synthesis_agent" in (step.transformer.handler if step.transformer and hasattr(step.transformer, "handler") else "")
+            "synthesis_agent"
+            in (step.transformer.handler if step.transformer and hasattr(step.transformer, "handler") else "")
             for step in guild_spec.routes.steps
         )
         assert to_synthesis, "No route found TO synthesis agent"
@@ -280,17 +279,13 @@ class TestRoutingLogicDeep:
         """Test the complete web research pipeline routing."""
         # QueryAgent → Splitter
         query_to_splitter = next(
-            step
-            for step in guild_spec.routes.steps
-            if step.agent and step.agent.name == "Query Agent"
+            step for step in guild_spec.routes.steps if step.agent and step.agent.name == "Query Agent"
         )
         assert query_to_splitter.destination.topics == "splitter_agent"
 
         # Splitter → Google + SERP (fanned out to two dedicated topics)
         splitter_routes = [
-            step
-            for step in guild_spec.routes.steps
-            if step.agent and step.agent.name == "Splitter Agent"
+            step for step in guild_spec.routes.steps if step.agent and step.agent.name == "Splitter Agent"
         ]
         assert len(splitter_routes) == 2
         for step in splitter_routes:
@@ -299,17 +294,13 @@ class TestRoutingLogicDeep:
 
         # SERP → Playwright
         serp_to_playwright = next(
-            step
-            for step in guild_spec.routes.steps
-            if step.message_format == "rustic_ai.serpapi.agent.SERPResults"
+            step for step in guild_spec.routes.steps if step.message_format == "rustic_ai.serpapi.agent.SERPResults"
         )
         assert serp_to_playwright.transformer.output_format == "rustic_ai.playwright.agent.WebScrapingRequest"
 
         # Playwright → Memory
         playwright_to_memory = next(
-            step
-            for step in guild_spec.routes.steps
-            if step.agent and step.agent.name == "Web Scraper Agent"
+            step for step in guild_spec.routes.steps if step.agent and step.agent.name == "Web Scraper Agent"
         )
         assert playwright_to_memory.destination.topics == "memory_ingest"
 
@@ -368,18 +359,14 @@ class TestRoutingLogicDeep:
 
         # Synthesis → user broadcast (completion point)
         synthesis_to_observe = next(
-            step
-            for step in guild_spec.routes.steps
-            if step.agent and step.agent.name == "Synthesis Agent"
+            step for step in guild_spec.routes.steps if step.agent and step.agent.name == "Synthesis Agent"
         )
         assert synthesis_to_observe.destination.topics == "user_message_broadcast"
         assert synthesis_to_observe.process_status == "completed"
 
     def test_completion_points(self, guild_spec: GuildSpec):
         """Test that completion points properly end the routing chain."""
-        completion_routes = [
-            step for step in guild_spec.routes.steps if step.process_status == "completed"
-        ]
+        completion_routes = [step for step in guild_spec.routes.steps if step.process_status == "completed"]
 
         # Each completion should send to user_message_broadcast
         # either via direct destination or via content_based_router handler
@@ -414,10 +401,12 @@ class TestRoutingLogicDeep:
             if source not in routing_graph:
                 routing_graph[source] = []
 
-            routing_graph[source].append({
-                "dest_topic": dest_topic,
-                "has_completion": step[1].process_status == "completed",
-            })
+            routing_graph[source].append(
+                {
+                    "dest_topic": dest_topic,
+                    "has_completion": step[1].process_status == "completed",
+                }
+            )
 
         # Check that routes with process_status=completed send to user broadcast
         # (either explicitly or via content_based_router)

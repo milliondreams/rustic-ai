@@ -136,6 +136,7 @@ debugger/
 
 # npm packages
 node_modules/
+.playwright-mcp/
 .claude/
 skills/.claude/
 

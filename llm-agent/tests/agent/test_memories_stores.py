@@ -3,10 +3,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
-import pytest
 from fsspec import filesystem
 from fsspec.implementations.asyn_wrapper import AsyncFileSystemWrapper
 from fsspec.implementations.dirfs import DirFileSystem as FileSystem
+import pytest
+
 from rustic_ai.core.guild.agent import Agent
 from rustic_ai.core.guild.agent_ext.depends.dependency_resolver import (
     DependencyResolver,
@@ -41,6 +42,7 @@ from rustic_ai.llm_agent.memories.queue_memories_store import (
 from rustic_ai.llm_agent.memories.state_memories_store import (
     StateBackedMemoriesStore,
 )
+
 from rustic_ai.testing.helpers import wrap_agent_for_testing
 
 # ------------------------------

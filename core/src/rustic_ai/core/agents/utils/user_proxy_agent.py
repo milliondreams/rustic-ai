@@ -155,9 +155,7 @@ class UserProxyAgent(Agent[UserProxyAgentProps], GuildRefreshMixin):
 
         history_size = self.config.conversation_history_size
         if history_size > 0:
-            routing_entry.transformer = FunctionalTransformer(
-                handler=json.dumps({"enrich_with_history": history_size})
-            )
+            routing_entry.transformer = FunctionalTransformer(handler=json.dumps({"enrich_with_history": history_size}))
 
         ctx.add_routing_step(routing_entry)
 

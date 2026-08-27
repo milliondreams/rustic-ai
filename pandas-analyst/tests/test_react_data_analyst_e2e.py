@@ -236,6 +236,7 @@ class TestReactDataAnalystWithMockedLLM:
                     max_iterations=10,
                     toolset=DataAnalystReActToolset(
                         filesystem_base_path=temp_data_dir,
+                        use_guild_filesystem=False,
                     ),
                     request_preprocessors=[FileUrlExtractorPreprocessor()],
                 )
@@ -339,6 +340,7 @@ class TestReactDataAnalystWithMockedLLM:
                     max_iterations=5,
                     toolset=DataAnalystReActToolset(
                         filesystem_base_path=temp_data_dir,
+                        use_guild_filesystem=False,
                     ),
                     request_preprocessors=[FileUrlExtractorPreprocessor()],
                 )
@@ -621,6 +623,7 @@ class TestToolCallVerification:
                     max_iterations=5,
                     toolset=DataAnalystReActToolset(
                         filesystem_base_path=temp_data_dir,
+                        use_guild_filesystem=False,
                     ),
                     request_preprocessors=[FileUrlExtractorPreprocessor()],
                 )

@@ -287,9 +287,7 @@ class BaseTestBackendABC(ABC):
         assert retrieved_message == m4
 
     # Test method to get messages since a given message ID ensuring newer messages with higher priority are not lost
-    def test_get_messages_for_topic_since_with_higher_priority(
-        self, backend: MessagingBackend, request
-    ):
+    def test_get_messages_for_topic_since_with_higher_priority(self, backend: MessagingBackend, request):
         """
         Verify the Redis/NATS contract for a guild's default topic at a
         priority-inverted timestamp boundary.
@@ -348,10 +346,7 @@ class BaseTestBackendABC(ABC):
             f"(priority={boundary.priority},timestamp={boundary.timestamp}), "
             f"returned={returned_details}"
         )
-        assert all(
-            message.topic_published_to == "default_topic"
-            for message in retrieved_messages
-        )
+        assert all(message.topic_published_to == "default_topic" for message in retrieved_messages)
 
         history = backend.get_messages_for_topic(topic)
         assert [message.id for message in history] == [

@@ -1,3 +1,5 @@
+"""Tests for the research manager's public agent classes."""
+
 from rustic_ai.core.utils.basic_class_utils import get_qualified_class_name
 from rustic_ai.research_manager.agent import ResearchManager, ResearchUpdates
 

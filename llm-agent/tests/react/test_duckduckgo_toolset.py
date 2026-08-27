@@ -1,3 +1,4 @@
+from email.message import Message as HTTPMessage
 import json
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
@@ -172,7 +173,7 @@ def test_interprets_success_no_result_and_network_failure():
     ("side_effect", "expected_code"),
     [
         (URLError("offline"), "network_error"),
-        (HTTPError("https://api.duckduckgo.com/", 429, "rate limited", {}, None), "http_error"),
+        (HTTPError("https://api.duckduckgo.com/", 429, "rate limited", HTTPMessage(), None), "http_error"),
     ],
 )
 def test_returns_bounded_network_errors(side_effect, expected_code):

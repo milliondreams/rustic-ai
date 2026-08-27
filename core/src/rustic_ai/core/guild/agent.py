@@ -7,7 +7,17 @@ import inspect
 import logging
 from queue import Queue
 import threading
-from typing import Any, Callable, Dict, Generic, List, Optional, Type, TypeVar, get_type_hints
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+    get_type_hints,
+)
 
 from pydantic import BaseModel, Field
 

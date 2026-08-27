@@ -33,22 +33,20 @@ class HistoryBasedMemoriesStore(MemoriesStore):
         return sender.name or sender.id
 
     @staticmethod
-    def _name_user_messages(
-        messages: list[LLMMessage], sender_name: str | None
-    ) -> list[LLMMessage]:
+    def _name_user_messages(messages: list[LLMMessage], sender_name: str | None) -> list[LLMMessage]:
         if not sender_name:
             return messages
         return [
-            message.model_copy(update={"name": sender_name})
-            if isinstance(message, UserMessage) and not message.name
-            else message
+            (
+                message.model_copy(update={"name": sender_name})
+                if isinstance(message, UserMessage) and not message.name
+                else message
+            )
             for message in messages
         ]
 
     @staticmethod
-    def _name_assistant_message(
-        message: LLMMessage, sender_name: str | None
-    ) -> LLMMessage:
+    def _name_assistant_message(message: LLMMessage, sender_name: str | None) -> LLMMessage:
         if sender_name and isinstance(message, AssistantMessage) and not message.name:
             return message.model_copy(update={"name": sender_name})
         return message
@@ -122,9 +120,7 @@ class HistoryBasedMemoriesStore(MemoriesStore):
         named_request = request.model_copy(update={"messages": named_messages})
         return super().preprocess(agent, ctx, named_request, llm)
 
-    def recall(
-        self, agent: Agent, ctx: ProcessContext, context: list[LLMMessage]
-    ) -> list[LLMMessage]:
+    def recall(self, agent: Agent, ctx: ProcessContext, context: list[LLMMessage]) -> list[LLMMessage]:
         enriched_history = ctx.get_context().get("enriched_history", [])
 
         messages = self._extract_messages_from_history(enriched_history)

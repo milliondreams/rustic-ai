@@ -171,7 +171,44 @@ sh -c '
 
         if [ "$CPU_COUNT" -gt 4 ]; then
             WORKERS=$((CPU_COUNT - 2))
-            printf "⚙️  Auto-configuring workers: %d cores detected, using %d workers (N-2)\n" "$CPU_COUNT" "$WORKERS"
+
+            # Importing the complete monorepo test graph takes substantial memory
+            # per worker (ML libraries in particular). Cap CPU-derived parallelism
+            # to roughly one worker per 4 GiB to avoid swapping or OOM-killing the
+            # test runner on memory-constrained CI hosts and container VMs.
+            MEMORY_KB=0
+            if [ -r /sys/fs/cgroup/memory.max ]; then
+                CGROUP_MEMORY_BYTES=$(cat /sys/fs/cgroup/memory.max)
+                case "$CGROUP_MEMORY_BYTES" in
+                    ""|max|*[!0-9]*) ;;
+                    *) MEMORY_KB=$((CGROUP_MEMORY_BYTES / 1024)) ;;
+                esac
+            fi
+            if [ "$MEMORY_KB" -eq 0 ] && [ -r /proc/meminfo ]; then
+                MEMORY_KB=$(awk "/^MemTotal:/ { print \$2; exit }" /proc/meminfo)
+            fi
+            if [ "$MEMORY_KB" -eq 0 ] && command -v sysctl >/dev/null 2>&1; then
+                MEMORY_BYTES=$(sysctl -n hw.memsize 2>/dev/null || printf 0)
+                MEMORY_KB=$((MEMORY_BYTES / 1024))
+            fi
+
+            if [ "$MEMORY_KB" -gt 0 ]; then
+                MEMORY_WORKERS=$((MEMORY_KB / 4194304))
+                if [ "$MEMORY_WORKERS" -lt 1 ]; then
+                    MEMORY_WORKERS=1
+                fi
+                if [ "$WORKERS" -gt "$MEMORY_WORKERS" ]; then
+                    WORKERS=$MEMORY_WORKERS
+                fi
+            fi
+
+            if [ "$WORKERS" -gt 1 ]; then
+                printf "⚙️  Auto-configuring workers: %d cores, %d MiB memory; using %d workers\n" \
+                    "$CPU_COUNT" "$((MEMORY_KB / 1024))" "$WORKERS"
+            else
+                printf "ℹ️  Available memory supports one worker. Disabling parallel execution.\n"
+                PARALLEL=0
+            fi
         else
             printf "ℹ️  Only %d cores detected (<= 4). Disabling parallel execution.\n" "$CPU_COUNT"
             PARALLEL=0

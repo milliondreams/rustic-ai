@@ -1,6 +1,12 @@
 from unittest.mock import MagicMock, patch
 
-from rustic_ai.fact_checker.agent import Claim, ClaimReview, ClaimsResponse, FactCheckerAgent, Publisher
+from rustic_ai.fact_checker.agent import (
+    Claim,
+    ClaimReview,
+    ClaimsResponse,
+    FactCheckerAgent,
+    Publisher,
+)
 
 
 @patch("rustic_ai.fact_checker.agent.build")

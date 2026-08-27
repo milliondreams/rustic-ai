@@ -131,7 +131,9 @@ class SERPAgent(Agent):
             if "search_information" in results and "total_results" in results["search_information"]:
                 total_results = results["search_information"]["total_results"]
 
-            self.logger.debug(f"Publishing {len(result_links)} search results for query: {search_query.query} with total results: {total_results}")
+            self.logger.debug(
+                f"Publishing {len(result_links)} search results for query: {search_query.query} with total results: {total_results}"
+            )
 
             ctx.send(
                 SERPResults(

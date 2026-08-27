@@ -1,3 +1,4 @@
+from email.message import Message as HTTPMessage
 import json
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
@@ -236,9 +237,9 @@ def test_interprets_success_no_result_ambiguity_and_errors():
     ("side_effect", "expected_code"),
     [
         (URLError("offline"), "network_error"),
-        (HTTPError(MediaWikiSearchToolset.API_URL, 429, "limited", {}, None), "rate_limited"),
-        (HTTPError(MediaWikiSearchToolset.API_URL, 503, "down", {}, None), "server_error"),
-        (HTTPError(MediaWikiSearchToolset.API_URL, 403, "forbidden", {}, None), "http_error"),
+        (HTTPError(MediaWikiSearchToolset.API_URL, 429, "limited", HTTPMessage(), None), "rate_limited"),
+        (HTTPError(MediaWikiSearchToolset.API_URL, 503, "down", HTTPMessage(), None), "server_error"),
+        (HTTPError(MediaWikiSearchToolset.API_URL, 403, "forbidden", HTTPMessage(), None), "http_error"),
     ],
 )
 def test_returns_bounded_network_errors(side_effect, expected_code):

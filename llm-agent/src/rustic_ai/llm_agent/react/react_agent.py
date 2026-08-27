@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 import json
 import logging
 import time
@@ -19,8 +20,10 @@ from rustic_ai.core.guild.agent_ext.depends.llm.llm import LLM
 from rustic_ai.core.guild.agent_ext.depends.llm.models import (
     AssistantMessage,
     ChatCompletionError,
+    ChatCompletionMessageToolCall,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatCompletionTool,
     ChatCompletionToolChoiceOption,
     Choice,
     CompletionUsage,
@@ -70,6 +73,31 @@ DEFAULT_REACT_SYSTEM_PROMPT = """Use the available tools for exact or verifiable
 """
 
 SKILL_SELECTOR_TOOL = "activate_tool_skill"
+
+
+@dataclass
+class _ReActLoopState:
+    """Mutable state shared by the small steps of a ReAct execution loop."""
+
+    messages: List[DiscriminatedLLMMessage]
+    tools: Optional[List[ChatCompletionTool]]
+    safe_handling: bool
+    trace: List[ReActStep] = field(default_factory=list)
+    final_response: Optional[ChatCompletionResponse] = None
+    iterations_completed: int = 0
+    total_usage: CompletionUsage = field(
+        default_factory=lambda: CompletionUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0)
+    )
+    executed_calls: dict[str, ReActToolOutcome | None] = field(default_factory=dict)
+    failure_attempts: dict[tuple[str, str], int] = field(default_factory=dict)
+    verified_results: list[dict[str, str]] = field(default_factory=list)
+    unresolved_failures: list[dict[str, str]] = field(default_factory=list)
+    last_interpreted_tool: Optional[str] = None
+    policy_termination: Optional[str] = None
+    active_skill_names: set[str] = field(default_factory=set)
+    domain_tool_required: bool = False
+    disclosure_expanded: bool = False
+    plugin_messages: list = field(default_factory=list)
 
 
 class ActivateToolSkillArgs(BaseModel):
@@ -350,42 +378,29 @@ class ReActAgent(Agent[ReActAgentConfig]):
         Returns:
             Tuple of (ChatCompletionResponse, plugin_messages)
         """
-        # Record start time for response
         start_time = int(time.time())
-
-        # Bind agent context to toolset for guild-scoped resource access
         self.config.toolset.bind_agent_context(
             org_id=self.get_organization(),
             guild_id=self.guild_id,
             agent_id=self.id,
         )
-
-        # Validate that required plugins are configured for this toolset
-        # This provides early detection of configuration errors
         all_preprocessors = self.config.request_preprocessors + self.config.iteration_preprocessors
         self.config.toolset.validate_plugins(
             request_preprocessors=all_preprocessors,
             tool_wrappers=self.config.tool_wrappers,
         )
-
-        # Extract system messages and user query from incoming request
         incoming_system_messages: List[SystemMessage] = []
         user_query: Optional[str] = None
-
         for msg in incoming_request.messages:
             if isinstance(msg, SystemMessage):
                 incoming_system_messages.append(msg)
             elif isinstance(msg, UserMessage):
-                # Use the last UserMessage as the query
                 if isinstance(msg.content, str):
                     user_query = msg.content
                 else:
-                    # ArrayOfContentParts - extract text parts
                     text_parts = [p.text for p in msg.content.root if hasattr(p, "text")]
                     user_query = " ".join(text_parts)
-
         if not user_query:
-            # No user query found - return error response
             return (
                 self._build_error_response(
                     "No user message found in request",
@@ -399,23 +414,9 @@ class ReActAgent(Agent[ReActAgentConfig]):
         skill_specs = self.config.toolset.get_skill_specs() if self.config.tool_disclosure == "skills" else []
         self._validate_skill_specs(self.config.toolset, skill_specs)
         skill_mode = bool(skill_specs)
-
-        # Build the messages list: incoming system messages + ReAct system prompt + user query
-        initial_messages: List[DiscriminatedLLMMessage] = []
-
-        # Append incoming system messages first (preserving user context)
-        for sys_msg in incoming_system_messages:
-            initial_messages.append(sys_msg)
-
-        # The selector tool carries the incremental-disclosure contract so custom
-        # replacement prompts receive the same model-facing instructions.
+        initial_messages: List[DiscriminatedLLMMessage] = list(incoming_system_messages)
         initial_messages.append(SystemMessage(content=self._get_system_prompt()))
-
-        # Append the user query
         initial_messages.append(UserMessage(content=user_query))
-
-        # Build initial request with tools from toolset
-        # Use temperature/max_tokens from incoming request if provided, else fall back to config
         initial_tools = (
             [self._skill_selector_spec(skill_specs).chat_tool]
             if skill_mode
@@ -427,361 +428,380 @@ class ReActAgent(Agent[ReActAgentConfig]):
             temperature=incoming_request.temperature or self.config.temperature,
             max_tokens=incoming_request.max_tokens or self.config.max_tokens,
         )
-
-        # PREPROCESS (once, before loop) - create a temporary context for the helper
         prepared_request = self._preprocess_if_needed(ctx, llm, initial_request)
+        state = _ReActLoopState(
+            messages=list(prepared_request.messages),
+            tools=prepared_request.tools,
+            safe_handling=self.config.failure_handling == "safe",
+        )
+        error = self._run_react_iterations(ctx, llm, skill_specs, state)
+        if error:
+            return (
+                self._build_error_response(error, start_time, state.trace, state.iterations_completed),
+                state.plugin_messages,
+            )
 
-        # Extract messages and tools from prepared request
-        messages: List[DiscriminatedLLMMessage] = list(prepared_request.messages)
-        tools = prepared_request.tools
+        loop_plugin_messages = self._postprocess_if_needed(ctx, llm, prepared_request, state.final_response)
+        all_plugin_messages = state.plugin_messages + loop_plugin_messages
+        return (self._finalize_react_loop(state, start_time), all_plugin_messages)
 
-        trace: List[ReActStep] = []
-        toolset = self.config.toolset
-        final_response: Optional[ChatCompletionResponse] = None
-        iterations_completed = 0
-        total_usage = CompletionUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0)
-
-        safe_handling = self.config.failure_handling == "safe"
-        executed_calls: dict[str, ReActToolOutcome | None] = {}
-        failure_attempts: dict[tuple[str, str], int] = {}
-        verified_results: list[dict[str, str]] = []
-        unresolved_failures: list[dict[str, str]] = []
-        last_interpreted_tool: Optional[str] = None
-        policy_termination: Optional[str] = None
-        active_skill_names: set[str] = set()
-        domain_tool_required = False
-        disclosure_expanded = False
-
-        all_iteration_messages: list = []  # Accumulate messages from iteration plugins
-
+    def _run_react_iterations(
+        self,
+        ctx: ProcessContext[ChatCompletionRequest],
+        llm: LLM,
+        skill_specs: List[ReActSkillSpec],
+        state: _ReActLoopState,
+    ) -> Optional[str]:
+        """Run model iterations, mutating shared loop state until completion."""
         for iteration in range(self.config.max_iterations):
-            iterations_completed = iteration + 1
+            state.iterations_completed = iteration + 1
             advertised_tool_names = {
-                tool.function.name for tool in (tools or []) if getattr(tool, "function", None) is not None
+                tool.function.name for tool in (state.tools or []) if getattr(tool, "function", None) is not None
             }
-
-            # Build request for this iteration
-            iteration_tools = tools
-            tool_choice = None
-            if domain_tool_required and self.config.skill_activation_followup == "required":
-                iteration_tools = [
-                    tool
-                    for tool in (tools or [])
-                    if getattr(getattr(tool, "function", None), "name", None) != SKILL_SELECTOR_TOOL
-                ]
-                tool_choice = ChatCompletionToolChoiceOption.required
-            iteration_request = ChatCompletionRequest(
-                messages=messages,
-                tools=iteration_tools,
-                tool_choice=tool_choice,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens,
-            )
-
-            # ITERATION PREPROCESS (before each LLM call)
+            iteration_request = self._build_react_iteration_request(state)
             iteration_request = self._preprocess_iteration_if_needed(ctx, llm, iteration_request, iteration)
-
-            # Call LLM
             response = self._call_llm_direct(llm, iteration_request)
-
             if isinstance(response, str):
-                # Error occurred - return error response
-                return (
-                    self._build_error_response(
-                        response,
-                        start_time,
-                        trace,
-                        iterations_completed,
-                    ),
-                    all_iteration_messages,
-                )
-
-            # Accumulate usage statistics
+                return response
             if response.usage:
-                total_usage = CompletionUsage(
-                    prompt_tokens=total_usage.prompt_tokens + response.usage.prompt_tokens,
-                    completion_tokens=total_usage.completion_tokens + response.usage.completion_tokens,
-                    total_tokens=total_usage.total_tokens + response.usage.total_tokens,
+                state.total_usage = CompletionUsage(
+                    prompt_tokens=state.total_usage.prompt_tokens + response.usage.prompt_tokens,
+                    completion_tokens=state.total_usage.completion_tokens + response.usage.completion_tokens,
+                    total_tokens=state.total_usage.total_tokens + response.usage.total_tokens,
                 )
-
-            # ITERATION POSTPROCESS (after each LLM call)
             iter_messages = self._postprocess_iteration_if_needed(ctx, llm, iteration_request, response, iteration)
-            all_iteration_messages.extend(iter_messages)
-
-            choice = response.choices[0]
-            assistant_message = choice.message
-
-            # Add assistant response to messages
-            messages.append(assistant_message)
-
-            # Check if we have tool calls
+            state.plugin_messages.extend(iter_messages)
+            assistant_message = response.choices[0].message
+            state.messages.append(assistant_message)
             if not assistant_message.tool_calls:
-                # No tool calls - this is the final answer
-                final_response = response
-                if safe_handling and unresolved_failures:
-                    policy_termination = "unresolved_tool_failure"
+                state.final_response = response
+                if state.safe_handling and state.unresolved_failures:
+                    state.policy_termination = "unresolved_tool_failure"
                 break
-
-            # Process each tool call
             for tool_call in assistant_message.tool_calls:
-                tool_name = tool_call.function.name
-                try:
-                    tool_args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError as e:
-                    tool_result = self._structured_tool_error(
-                        "invalid_arguments",
-                        f"Tool arguments are not valid JSON: {self._bounded_error(e)}",
-                    )
-                    argument_error_outcome = ReActToolOutcome(
-                        disposition=ToolOutcomeDisposition.RETRYABLE_ERROR,
-                        code="invalid_arguments",
-                        message="Tool arguments were not valid JSON.",
-                    )
-                    attempt = self._record_failure_attempt(failure_attempts, tool_name, argument_error_outcome)
-                    trace.append(
-                        ReActStep(
-                            thought=assistant_message.content,
-                            action=tool_name,
-                            action_input={"raw": tool_call.function.arguments},
-                            observation=tool_result,
-                            outcome=argument_error_outcome.disposition.value,
-                            error_code=argument_error_outcome.code,
-                            attempt=attempt,
-                            model_round=iterations_completed,
-                        )
-                    )
-                    messages.append(
-                        ToolMessage(
-                            tool_call_id=tool_call.id,
-                            content=tool_result,
-                        )
-                    )
-                    self._append_failure(unresolved_failures, tool_name, argument_error_outcome)
-                    last_interpreted_tool = tool_name
-                    if safe_handling and attempt >= 2:
-                        policy_termination = "tool_retry_exhausted"
-                    continue
-
-                if skill_mode and tool_name == SKILL_SELECTOR_TOOL:
-                    selection_result, selection_outcome, activated = self._activate_skill(
-                        tool_args,
-                        skill_specs,
-                        active_skill_names,
-                    )
-                    if activated:
-                        active_skill_names.add(activated)
-                        tools = self._disclosed_tools(skill_specs, active_skill_names)
-                        domain_tool_required = True
-                    attempt = 1
-                    if selection_outcome.disposition != ToolOutcomeDisposition.SUCCESS:
-                        attempt = self._record_failure_attempt(failure_attempts, tool_name, selection_outcome)
-                    trace.append(
-                        ReActStep(
-                            thought=assistant_message.content,
-                            action=tool_name,
-                            action_input=tool_args if isinstance(tool_args, dict) else {"raw": tool_args},
-                            observation=selection_result,
-                            outcome=selection_outcome.disposition.value,
-                            error_code=selection_outcome.code,
-                            attempt=attempt,
-                            executed=False,
-                            model_round=iterations_completed,
-                        )
-                    )
-                    messages.append(ToolMessage(tool_call_id=tool_call.id, content=selection_result))
-                    if selection_outcome.disposition == ToolOutcomeDisposition.SUCCESS:
-                        self._resolve_latest_failure(unresolved_failures, tool_name)
-                    else:
-                        self._append_failure(unresolved_failures, tool_name, selection_outcome)
-                        if safe_handling and attempt >= 2:
-                            policy_termination = "tool_retry_exhausted"
-                    continue
-
-                if skill_mode and tool_name not in advertised_tool_names:
-                    tool_result = self._structured_tool_error(
-                        "tool_not_disclosed",
-                        "This tool is not available yet. Activate its skill, then call the tool in a later round.",
-                    )
-                    disclosure_outcome = ReActToolOutcome(
-                        disposition=ToolOutcomeDisposition.RETRYABLE_ERROR,
-                        code="tool_not_disclosed",
-                        message="The tool was called before it was disclosed.",
-                    )
-                    attempt = self._record_failure_attempt(failure_attempts, tool_name, disclosure_outcome)
-                    trace.append(
-                        ReActStep(
-                            thought=assistant_message.content,
-                            action=tool_name,
-                            action_input=tool_args,
-                            observation=tool_result,
-                            outcome=disclosure_outcome.disposition.value,
-                            error_code=disclosure_outcome.code,
-                            attempt=attempt,
-                            executed=False,
-                            model_round=iterations_completed,
-                        )
-                    )
-                    messages.append(ToolMessage(tool_call_id=tool_call.id, content=tool_result))
-                    self._append_failure(unresolved_failures, tool_name, disclosure_outcome)
-                    last_interpreted_tool = tool_name
-                    if safe_handling and attempt >= 2:
-                        policy_termination = "tool_retry_exhausted"
-                    continue
-
-                fingerprint = self._tool_call_fingerprint(tool_name, tool_args)
-                if safe_handling and fingerprint in executed_calls:
-                    previous_outcome = executed_calls[fingerprint]
-                    tool_result = self._structured_tool_error(
-                        "duplicate_tool_call",
-                        "This exact tool call was already executed; use its existing observation.",
-                    )
-                    duplicate_outcome = ReActToolOutcome(
-                        disposition=ToolOutcomeDisposition.TERMINAL_ERROR,
-                        code="duplicate_tool_call",
-                        message="An identical tool call was suppressed.",
-                    )
-                    previous_succeeded = (
-                        previous_outcome is not None and previous_outcome.disposition == ToolOutcomeDisposition.SUCCESS
-                    )
-                    trace.append(
-                        ReActStep(
-                            thought=assistant_message.content,
-                            action=tool_name,
-                            action_input=tool_args,
-                            observation=tool_result,
-                            outcome=duplicate_outcome.disposition.value,
-                            error_code=duplicate_outcome.code,
-                            attempt=2,
-                            executed=False,
-                            model_round=iterations_completed,
-                        )
-                    )
-                    messages.append(ToolMessage(tool_call_id=tool_call.id, content=tool_result))
-                    if not previous_succeeded:
-                        self._append_failure(unresolved_failures, tool_name, duplicate_outcome)
-                    policy_termination = "duplicate_tool_call"
-                    last_interpreted_tool = tool_name
-                    continue
-
-                # Execute tool with wrapper pipeline
-                tool_result, tool_messages, outcome = self._execute_tool_with_wrappers(
-                    ctx, tool_name, tool_args, toolset, assistant_message.content
+                self._process_react_tool_call(
+                    ctx, assistant_message, tool_call, advertised_tool_names, skill_specs, state
                 )
-                domain_tool_required = False
-                all_iteration_messages.extend(tool_messages)
-                executed_calls[fingerprint] = outcome
-
-                attempt = 1
-                if outcome and outcome.disposition != ToolOutcomeDisposition.SUCCESS:
-                    attempt = self._record_failure_attempt(failure_attempts, tool_name, outcome)
-
-                # Record in trace
-                trace.append(
-                    ReActStep(
-                        thought=assistant_message.content,
-                        action=tool_name,
-                        action_input=tool_args,
-                        observation=tool_result,
-                        outcome=outcome.disposition.value if outcome else None,
-                        error_code=outcome.code if outcome else None,
-                        attempt=attempt,
-                        model_round=iterations_completed,
-                    )
-                )
-
-                # Add tool result to messages
-                messages.append(
-                    ToolMessage(
-                        tool_call_id=tool_call.id,
-                        content=tool_result,
-                    )
-                )
-
-                if (
-                    skill_mode
-                    and not disclosure_expanded
-                    and self.config.skill_disclosure_progression == "expand_after_first_success"
-                    and (outcome is None or outcome.disposition == ToolOutcomeDisposition.SUCCESS)
-                ):
-                    tools = toolset.chat_tools if toolset.tool_count > 0 else None
-                    disclosure_expanded = True
-
-                if not safe_handling or outcome is None:
-                    last_interpreted_tool = None
-                    continue
-
-                if outcome.disposition == ToolOutcomeDisposition.SUCCESS:
-                    if outcome.verified_summary:
-                        verified_results.append({"tool": tool_name, "summary": outcome.verified_summary})
-                    if last_interpreted_tool == tool_name:
-                        self._resolve_latest_failure(unresolved_failures, tool_name)
-                    last_interpreted_tool = tool_name
-                    continue
-
-                self._append_failure(unresolved_failures, tool_name, outcome)
-                last_interpreted_tool = tool_name
-                if outcome.disposition == ToolOutcomeDisposition.CLARIFICATION_REQUIRED:
-                    policy_termination = "clarification_required"
-                elif outcome.disposition == ToolOutcomeDisposition.TERMINAL_ERROR:
-                    policy_termination = "tool_failure"
-                elif attempt >= 2:
-                    policy_termination = "tool_retry_exhausted"
-
-            if policy_termination:
+            if state.policy_termination:
                 break
+        return None
 
-        # POSTPROCESS (once, after loop)
-        loop_plugin_messages = self._postprocess_if_needed(ctx, llm, prepared_request, final_response)
+    def _build_react_iteration_request(self, state: _ReActLoopState) -> ChatCompletionRequest:
+        """Build the next model request from current disclosure state."""
+        iteration_tools = state.tools
+        tool_choice = None
+        if state.domain_tool_required and self.config.skill_activation_followup == "required":
+            iteration_tools = [
+                tool
+                for tool in (state.tools or [])
+                if getattr(getattr(tool, "function", None), "name", None) != SKILL_SELECTOR_TOOL
+            ]
+            tool_choice = ChatCompletionToolChoiceOption.required
+        return ChatCompletionRequest(
+            messages=state.messages,
+            tools=iteration_tools,
+            tool_choice=tool_choice,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+        )
 
-        # Combine iteration messages with loop-level plugin messages
-        all_plugin_messages = all_iteration_messages + loop_plugin_messages
+    def _process_react_tool_call(
+        self,
+        ctx: ProcessContext[ChatCompletionRequest],
+        assistant_message: AssistantMessage,
+        tool_call: ChatCompletionMessageToolCall,
+        advertised_tool_names: set[str],
+        skill_specs: List[ReActSkillSpec],
+        state: _ReActLoopState,
+    ) -> None:
+        """Route one model tool call to the appropriate bounded handler."""
+        tool_name = tool_call.function.name
+        try:
+            tool_args = json.loads(tool_call.function.arguments)
+        except json.JSONDecodeError as error:
+            self._handle_invalid_tool_arguments(assistant_message, tool_call, tool_name, error, state)
+            return
+        if skill_specs and tool_name == SKILL_SELECTOR_TOOL:
+            self._handle_skill_activation(assistant_message, tool_call, tool_args, skill_specs, state)
+            return
+        if skill_specs and tool_name not in advertised_tool_names:
+            self._handle_undisclosed_tool(assistant_message, tool_call, tool_name, tool_args, state)
+            return
+        fingerprint = self._tool_call_fingerprint(tool_name, tool_args)
+        if state.safe_handling and fingerprint in state.executed_calls:
+            self._handle_duplicate_tool_call(assistant_message, tool_call, tool_name, tool_args, fingerprint, state)
+            return
+        self._handle_executed_tool_call(
+            ctx, assistant_message, tool_call, tool_name, tool_args, fingerprint, skill_specs, state
+        )
 
-        # Build final response as ChatCompletionResponse
-        if policy_termination:
-            return (
-                self._build_policy_response(
-                    start_time=start_time,
-                    trace=trace,
-                    iterations=iterations_completed,
-                    usage=total_usage,
-                    termination_reason=policy_termination,
-                    verified_results=verified_results,
-                    unresolved_failures=unresolved_failures,
-                ),
-                all_plugin_messages,
+    def _handle_invalid_tool_arguments(
+        self,
+        assistant_message: AssistantMessage,
+        tool_call: ChatCompletionMessageToolCall,
+        tool_name: str,
+        error: json.JSONDecodeError,
+        state: _ReActLoopState,
+    ) -> None:
+        tool_result = self._structured_tool_error(
+            "invalid_arguments",
+            f"Tool arguments are not valid JSON: {self._bounded_error(error)}",
+        )
+        outcome = ReActToolOutcome(
+            disposition=ToolOutcomeDisposition.RETRYABLE_ERROR,
+            code="invalid_arguments",
+            message="Tool arguments were not valid JSON.",
+        )
+        attempt = self._record_failure_attempt(state.failure_attempts, tool_name, outcome)
+        state.trace.append(
+            ReActStep(
+                thought=assistant_message.content,
+                action=tool_name,
+                action_input={"raw": tool_call.function.arguments},
+                observation=tool_result,
+                outcome=outcome.disposition.value,
+                error_code=outcome.code,
+                attempt=attempt,
+                model_round=state.iterations_completed,
             )
-        if final_response:
-            return (
-                self._build_success_response(
-                    answer=final_response.choices[0].message.content or "",
-                    start_time=start_time,
-                    trace=trace,
-                    iterations=iterations_completed,
-                    usage=total_usage,
-                    termination_reason="completed",
-                ),
-                all_plugin_messages,
+        )
+        state.messages.append(ToolMessage(tool_call_id=tool_call.id, content=tool_result))
+        self._append_failure(state.unresolved_failures, tool_name, outcome)
+        state.last_interpreted_tool = tool_name
+        if state.safe_handling and attempt >= 2:
+            state.policy_termination = "tool_retry_exhausted"
+
+    def _handle_skill_activation(
+        self,
+        assistant_message: AssistantMessage,
+        tool_call: ChatCompletionMessageToolCall,
+        tool_args: dict,
+        skill_specs: List[ReActSkillSpec],
+        state: _ReActLoopState,
+    ) -> None:
+        tool_name = tool_call.function.name
+        result, outcome, activated = self._activate_skill(tool_args, skill_specs, state.active_skill_names)
+        if activated:
+            state.active_skill_names.add(activated)
+            state.tools = self._disclosed_tools(skill_specs, state.active_skill_names)
+            state.domain_tool_required = True
+        attempt = 1
+        if outcome.disposition != ToolOutcomeDisposition.SUCCESS:
+            attempt = self._record_failure_attempt(state.failure_attempts, tool_name, outcome)
+        state.trace.append(
+            ReActStep(
+                thought=assistant_message.content,
+                action=tool_name,
+                action_input=tool_args if isinstance(tool_args, dict) else {"raw": tool_args},
+                observation=result,
+                outcome=outcome.disposition.value,
+                error_code=outcome.code,
+                attempt=attempt,
+                executed=False,
+                model_round=state.iterations_completed,
             )
-        else:
-            # Max iterations reached
-            if safe_handling and (verified_results or unresolved_failures):
-                response = self._build_policy_response(
-                    start_time=start_time,
-                    trace=trace,
-                    iterations=self.config.max_iterations,
-                    usage=total_usage,
-                    termination_reason="max_iterations",
-                    verified_results=verified_results,
-                    unresolved_failures=unresolved_failures,
-                )
-            else:
-                response = self._build_max_iterations_response(
-                    start_time=start_time,
-                    trace=trace,
-                    iterations=self.config.max_iterations,
-                    usage=total_usage,
-                )
-            return (response, all_plugin_messages)
+        )
+        state.messages.append(ToolMessage(tool_call_id=tool_call.id, content=result))
+        if outcome.disposition == ToolOutcomeDisposition.SUCCESS:
+            self._resolve_latest_failure(state.unresolved_failures, tool_name)
+            return
+        self._append_failure(state.unresolved_failures, tool_name, outcome)
+        if state.safe_handling and attempt >= 2:
+            state.policy_termination = "tool_retry_exhausted"
+
+    def _handle_undisclosed_tool(
+        self,
+        assistant_message: AssistantMessage,
+        tool_call: ChatCompletionMessageToolCall,
+        tool_name: str,
+        tool_args: dict,
+        state: _ReActLoopState,
+    ) -> None:
+        tool_result = self._structured_tool_error(
+            "tool_not_disclosed",
+            "This tool is not available yet. Activate its skill, then call the tool in a later round.",
+        )
+        outcome = ReActToolOutcome(
+            disposition=ToolOutcomeDisposition.RETRYABLE_ERROR,
+            code="tool_not_disclosed",
+            message="The tool was called before it was disclosed.",
+        )
+        attempt = self._record_failure_attempt(state.failure_attempts, tool_name, outcome)
+        state.trace.append(
+            ReActStep(
+                thought=assistant_message.content,
+                action=tool_name,
+                action_input=tool_args,
+                observation=tool_result,
+                outcome=outcome.disposition.value,
+                error_code=outcome.code,
+                attempt=attempt,
+                executed=False,
+                model_round=state.iterations_completed,
+            )
+        )
+        state.messages.append(ToolMessage(tool_call_id=tool_call.id, content=tool_result))
+        self._append_failure(state.unresolved_failures, tool_name, outcome)
+        state.last_interpreted_tool = tool_name
+        if state.safe_handling and attempt >= 2:
+            state.policy_termination = "tool_retry_exhausted"
+
+    def _handle_duplicate_tool_call(
+        self,
+        assistant_message: AssistantMessage,
+        tool_call: ChatCompletionMessageToolCall,
+        tool_name: str,
+        tool_args: dict,
+        fingerprint: str,
+        state: _ReActLoopState,
+    ) -> None:
+        previous_outcome = state.executed_calls[fingerprint]
+        tool_result = self._structured_tool_error(
+            "duplicate_tool_call",
+            "This exact tool call was already executed; use its existing observation.",
+        )
+        outcome = ReActToolOutcome(
+            disposition=ToolOutcomeDisposition.TERMINAL_ERROR,
+            code="duplicate_tool_call",
+            message="An identical tool call was suppressed.",
+        )
+        previous_succeeded = (
+            previous_outcome is not None and previous_outcome.disposition == ToolOutcomeDisposition.SUCCESS
+        )
+        state.trace.append(
+            ReActStep(
+                thought=assistant_message.content,
+                action=tool_name,
+                action_input=tool_args,
+                observation=tool_result,
+                outcome=outcome.disposition.value,
+                error_code=outcome.code,
+                attempt=2,
+                executed=False,
+                model_round=state.iterations_completed,
+            )
+        )
+        state.messages.append(ToolMessage(tool_call_id=tool_call.id, content=tool_result))
+        if not previous_succeeded:
+            self._append_failure(state.unresolved_failures, tool_name, outcome)
+        state.policy_termination = "duplicate_tool_call"
+        state.last_interpreted_tool = tool_name
+
+    def _handle_executed_tool_call(
+        self,
+        ctx: ProcessContext[ChatCompletionRequest],
+        assistant_message: AssistantMessage,
+        tool_call: ChatCompletionMessageToolCall,
+        tool_name: str,
+        tool_args: dict,
+        fingerprint: str,
+        skill_specs: List[ReActSkillSpec],
+        state: _ReActLoopState,
+    ) -> None:
+        toolset = self.config.toolset
+        tool_result, tool_messages, outcome = self._execute_tool_with_wrappers(
+            ctx, tool_name, tool_args, toolset, assistant_message.content
+        )
+        state.domain_tool_required = False
+        state.plugin_messages.extend(tool_messages)
+        state.executed_calls[fingerprint] = outcome
+        attempt = 1
+        if outcome and outcome.disposition != ToolOutcomeDisposition.SUCCESS:
+            attempt = self._record_failure_attempt(state.failure_attempts, tool_name, outcome)
+        state.trace.append(
+            ReActStep(
+                thought=assistant_message.content,
+                action=tool_name,
+                action_input=tool_args,
+                observation=tool_result,
+                outcome=outcome.disposition.value if outcome else None,
+                error_code=outcome.code if outcome else None,
+                attempt=attempt,
+                model_round=state.iterations_completed,
+            )
+        )
+        state.messages.append(ToolMessage(tool_call_id=tool_call.id, content=tool_result))
+        if self._should_expand_disclosure(skill_specs, outcome, state):
+            state.tools = toolset.chat_tools if toolset.tool_count > 0 else None
+            state.disclosure_expanded = True
+        self._record_tool_outcome(tool_name, outcome, attempt, state)
+
+    def _should_expand_disclosure(
+        self,
+        skill_specs: List[ReActSkillSpec],
+        outcome: Optional[ReActToolOutcome],
+        state: _ReActLoopState,
+    ) -> bool:
+        return bool(
+            skill_specs
+            and not state.disclosure_expanded
+            and self.config.skill_disclosure_progression == "expand_after_first_success"
+            and (outcome is None or outcome.disposition == ToolOutcomeDisposition.SUCCESS)
+        )
+
+    def _record_tool_outcome(
+        self,
+        tool_name: str,
+        outcome: Optional[ReActToolOutcome],
+        attempt: int,
+        state: _ReActLoopState,
+    ) -> None:
+        if not state.safe_handling or outcome is None:
+            state.last_interpreted_tool = None
+            return
+        if outcome.disposition == ToolOutcomeDisposition.SUCCESS:
+            if outcome.verified_summary:
+                state.verified_results.append({"tool": tool_name, "summary": outcome.verified_summary})
+            if state.last_interpreted_tool == tool_name:
+                self._resolve_latest_failure(state.unresolved_failures, tool_name)
+            state.last_interpreted_tool = tool_name
+            return
+        self._append_failure(state.unresolved_failures, tool_name, outcome)
+        state.last_interpreted_tool = tool_name
+        if outcome.disposition == ToolOutcomeDisposition.CLARIFICATION_REQUIRED:
+            state.policy_termination = "clarification_required"
+        elif outcome.disposition == ToolOutcomeDisposition.TERMINAL_ERROR:
+            state.policy_termination = "tool_failure"
+        elif attempt >= 2:
+            state.policy_termination = "tool_retry_exhausted"
+
+    def _finalize_react_loop(self, state: _ReActLoopState, start_time: int) -> ChatCompletionResponse:
+        """Convert completed loop state into the public chat response."""
+        if state.policy_termination:
+            return self._build_policy_response(
+                start_time=start_time,
+                trace=state.trace,
+                iterations=state.iterations_completed,
+                usage=state.total_usage,
+                termination_reason=state.policy_termination,
+                verified_results=state.verified_results,
+                unresolved_failures=state.unresolved_failures,
+            )
+        if state.final_response:
+            return self._build_success_response(
+                answer=state.final_response.choices[0].message.content or "",
+                start_time=start_time,
+                trace=state.trace,
+                iterations=state.iterations_completed,
+                usage=state.total_usage,
+                termination_reason="completed",
+            )
+        if state.safe_handling and (state.verified_results or state.unresolved_failures):
+            return self._build_policy_response(
+                start_time=start_time,
+                trace=state.trace,
+                iterations=self.config.max_iterations,
+                usage=state.total_usage,
+                termination_reason="max_iterations",
+                verified_results=state.verified_results,
+                unresolved_failures=state.unresolved_failures,
+            )
+        return self._build_max_iterations_response(
+            start_time=start_time,
+            trace=state.trace,
+            iterations=self.config.max_iterations,
+            usage=state.total_usage,
+        )
 
     def _preprocess_if_needed(
         self,

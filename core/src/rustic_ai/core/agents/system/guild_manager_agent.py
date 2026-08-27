@@ -716,7 +716,7 @@ class GuildManagerAgent(Agent[GuildManagerAgentProps]):
                 .set_properties(
                     UserProxyAgentProps(
                         user_id=user_id,
-                        conversation_history_size=self.guild_spec.properties.get(
+                        conversation_history_size=self.original_guild_spec.properties.get(
                             "conversation_history_size", 0
                         ),
                     )

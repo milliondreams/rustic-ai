@@ -102,7 +102,9 @@ class GoogleResearchAgent(Agent[GoogleResearchAgentProps], VertexAIBase):
                 created=int(datetime.now().timestamp()),
             )
 
-            self.logger.debug(f"Sending research findings for query: {query} with ID: {query_id} and grounding info: {grounding}")
+            self.logger.debug(
+                f"Sending research findings for query: {query} with ID: {query_id} and grounding info: {grounding}"
+            )
 
             ctx.send(payload=ccr, reason=grounding)
         except Exception as e:

@@ -516,7 +516,9 @@ class PlaywrightScraperAgent(Agent[PlaywrightScraperConfig]):
                         )
                     )
 
-            self.logger.debug(f"Scraping completed for request: {scraping_request.id}. Total unique documents scraped: {len(scraped_docs)}")
+            self.logger.debug(
+                f"Scraping completed for request: {scraping_request.id}. Total unique documents scraped: {len(scraped_docs)}"
+            )
 
             return scraped_docs, errors
 
@@ -542,9 +544,7 @@ class PlaywrightScraperAgent(Agent[PlaywrightScraperConfig]):
         scraping_request = ctx.payload
 
         # Run the actual scraping in the playwright event loop thread
-        scraped_docs, errors = self._run_in_playwright_loop(
-            self._do_scrape(scraping_request, filesystem)
-        )
+        scraped_docs, errors = self._run_in_playwright_loop(self._do_scrape(scraping_request, filesystem))
 
         # Send results back through the context (must be done in calling context)
         for doc in scraped_docs:

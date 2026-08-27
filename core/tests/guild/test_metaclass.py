@@ -4,9 +4,9 @@ import pytest
 from rustic_ai.core.guild.agent import Agent, processor
 from rustic_ai.core.guild.dsl import AgentSpec, BaseAgentProps
 from rustic_ai.core.guild.metaprog.agent_annotations import AgentAnnotations
+from rustic_ai.core.guild.metaprog.agent_metaclass import MetaclassHelper
 from rustic_ai.core.guild.metaprog.agent_registry import AgentDependency, AgentRegistry
 from rustic_ai.core.guild.metaprog.constants import MetaclassConstants
-from rustic_ai.core.guild.metaprog.agent_metaclass import MetaclassHelper
 from rustic_ai.core.utils import JsonDict
 
 
