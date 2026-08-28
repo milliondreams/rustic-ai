@@ -70,7 +70,9 @@ class MemoryAgent(Agent[MemoryAgentConfig]):
         """
         req = ctx.payload
 
-        logger.debug(f"Observing turn from sender: {req.sender_id}, content: {req.content}, session_id: {req.session_id}")
+        logger.debug(
+            f"Observing turn from sender: {req.sender_id}, content: {req.content}, session_id: {req.session_id}"
+        )
 
         # Determine session ID (fallback to config default or guild_id)
         session_id = req.session_id or self.config.default_session_id or ctx.agent.guild_id
@@ -773,9 +775,7 @@ class MemoryAgent(Agent[MemoryAgentConfig]):
             goal_view = self._serialize_goal_view(context.goal)
             tasks = [self._serialize_task_view(t) for t in context.tasks] if req.include_tasks else []
             episodes = (
-                [{"message_id": message_id} for message_id in context.recent_messages]
-                if req.include_episodes
-                else []
+                [{"message_id": message_id} for message_id in context.recent_messages] if req.include_episodes else []
             )
 
             ctx.send(

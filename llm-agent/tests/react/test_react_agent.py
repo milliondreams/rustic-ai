@@ -1,8 +1,8 @@
 import json
-from typing import Any, List, Optional
+from typing import Any, ClassVar, List, Optional
 from unittest.mock import patch
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, ValidationError
 import pytest
 
 from rustic_ai.core.guild.agent_ext.depends.dependency_resolver import DependencySpec
@@ -23,11 +23,19 @@ from rustic_ai.core.guild.agent_ext.depends.llm.tools_manager import ToolSpec
 from rustic_ai.core.guild.builders import AgentBuilder
 from rustic_ai.core.guild.dsl import AgentSpec
 from rustic_ai.llm_agent.react import (
+    DEFAULT_REACT_SYSTEM_PROMPT,
     CompositeToolset,
+    DuckDuckGoInstantAnswerToolset,
+    MathToolset,
+    MediaWikiSearchToolset,
     ReActAgent,
     ReActAgentConfig,
+    ReActSkillSpec,
     ReActStep,
+    ReActToolOutcome,
     ReActToolset,
+    TemporalToolset,
+    ToolOutcomeDisposition,
 )
 
 from rustic_ai.testing.helpers import wrap_agent_for_testing
@@ -44,6 +52,33 @@ class SearchParams(BaseModel):
     """Parameters for search tool."""
 
     query: str
+
+
+class StrictParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    count: int
+
+
+def test_default_prompt_is_short_and_tool_agnostic():
+    assert len(DEFAULT_REACT_SYSTEM_PROMPT.split()) < 120
+    assert "dependent steps" in DEFAULT_REACT_SYSTEM_PROMPT
+    assert "never repeat identical arguments" in DEFAULT_REACT_SYSTEM_PROMPT
+    assert "calculate" not in DEFAULT_REACT_SYSTEM_PROMPT
+    assert "mediawiki" not in DEFAULT_REACT_SYSTEM_PROMPT
+
+
+def test_validation_error_message_is_compact():
+    with pytest.raises(ValidationError) as exc_info:
+        StrictParams.model_validate({"count": "not-an-integer", "extra": True})
+
+    message = ReActAgent._validation_error_message(exc_info.value)
+
+    assert message.startswith("Invalid tool arguments: ")
+    assert "count:" in message
+    assert "extra:" in message
+    assert "input_value" not in message
+    assert "https://" not in message
 
 
 # Test toolset implementation
@@ -88,6 +123,104 @@ class SearchToolset(ReActToolset):
             assert isinstance(args, SearchParams)
             return f"Search results for: {args.query}"
         raise ValueError(f"Unknown tool: {tool_name}")
+
+
+class BrokenSkillToolset(CalculatorToolset):
+    def get_skill_specs(self) -> List[ReActSkillSpec]:
+        return [
+            ReActSkillSpec(
+                name="broken",
+                description="References a tool this toolset does not own.",
+                tool_names=["missing_tool"],
+            )
+        ]
+
+
+class PartiallySkilledToolset(ReActToolset):
+    def get_toolspecs(self) -> List[ToolSpec]:
+        return CalculatorToolset().get_toolspecs() + SearchToolset().get_toolspecs()
+
+    def get_skill_specs(self) -> List[ReActSkillSpec]:
+        return [
+            ReActSkillSpec(
+                name="arithmetic",
+                description="Arithmetic only.",
+                tool_names=["calculate"],
+            )
+        ]
+
+    def execute(self, tool_name: str, args: BaseModel) -> str:
+        raise NotImplementedError
+
+
+class SiblingClaimingToolset(SearchToolset):
+    def get_skill_specs(self) -> List[ReActSkillSpec]:
+        return [
+            ReActSkillSpec(
+                name="bad_search",
+                description="Incorrectly claims another child tool.",
+                tool_names=["calculate"],
+            )
+        ]
+
+
+class ConflictingSharedSkillToolset(SearchToolset):
+    def get_skill_specs(self) -> List[ReActSkillSpec]:
+        return [
+            ReActSkillSpec(
+                name="math_and_units",
+                description="A conflicting description.",
+                tool_names=["search"],
+            )
+        ]
+
+
+class CountingMathToolset(MathToolset):
+    execution_count: ClassVar[int] = 0
+
+    def execute(self, tool_name: str, args: BaseModel) -> str:
+        type(self).execution_count += 1
+        return super().execute(tool_name, args)
+
+
+class FixedLookupToolset(ReActToolset):
+    outcomes: ClassVar[List[str]] = ["no_result"]
+    execution_count: ClassVar[int] = 0
+
+    def get_toolspecs(self) -> List[ToolSpec]:
+        return [
+            ToolSpec(
+                name="duckduckgo_instant_answer",
+                description="Look up a concise entity or topic.",
+                parameter_class=SearchParams,
+            )
+        ]
+
+    def execute(self, tool_name: str, args: BaseModel) -> str:
+        index = min(type(self).execution_count, len(type(self).outcomes) - 1)
+        type(self).execution_count += 1
+        status = type(self).outcomes[index]
+        if status == "ok":
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "abstract": {"text": "Paris is the capital of France."},
+                }
+            )
+        return json.dumps({"status": "no_result", "query": getattr(args, "query", "")})
+
+    def interpret_result(self, tool_name: str, args: BaseModel, result: str) -> Optional[ReActToolOutcome]:
+        payload = json.loads(result)
+        if payload["status"] == "ok":
+            return ReActToolOutcome(
+                disposition=ToolOutcomeDisposition.SUCCESS,
+                verified_summary=payload["abstract"]["text"],
+            )
+        return ReActToolOutcome(
+            disposition=ToolOutcomeDisposition.NO_RESULT,
+            code="no_result",
+            message="The lookup could not verify this fact.",
+        )
 
 
 def create_mock_response(
@@ -243,6 +376,78 @@ class TestCompositeToolset:
         with pytest.raises(ValueError, match="Unknown tool"):
             composite.execute("nonexistent", CalculateParams(expression="1"))
 
+    def test_builtin_math_exposes_one_coherent_skill_group(self):
+        composite = CompositeToolset(toolsets=[MathToolset()])
+
+        assert composite.get_skill_specs() == [
+            ReActSkillSpec(
+                name="math_and_units",
+                description="Arithmetic, statistics, rounding, and physical-unit conversion.",
+                tool_names=["calculate", "convert_units"],
+                instructions=(
+                    "Use expression syntax only. Do not put prose, units, or currency symbols in expressions. "
+                    "Use this for physical conversions; qualify US and Imperial volume standards."
+                ),
+                examples=[
+                    "15 / 100 * 240",
+                    "round(86.4 * 1.18 / 4, 2)",
+                    "5 mi to km",
+                    "90 km/h to m/s",
+                ],
+                order=10,
+            ),
+        ]
+
+    def test_composite_merges_compatible_shared_skill_groups(self):
+        composite = CompositeToolset(toolsets=[DuckDuckGoInstantAnswerToolset(), MediaWikiSearchToolset()])
+
+        skills = composite.get_skill_specs()
+
+        assert len(skills) == 1
+        assert skills[0].name == "knowledge_lookup"
+        assert skills[0].tool_names == ["mediawiki_search", "duckduckgo_instant_answer"]
+        assert skills[0].instructions == (
+            "Use a concise article title or topic, not a long question. This is not current web search. "
+            "Use only when Instant Answers is requested or appropriate; it is not general web search."
+        )
+        assert len(skills[0].examples) == 4
+
+    def test_builtin_skill_order_is_independent_of_composite_order(self):
+        composite = CompositeToolset(
+            toolsets=[
+                DuckDuckGoInstantAnswerToolset(),
+                TemporalToolset(),
+                MediaWikiSearchToolset(),
+                MathToolset(),
+            ]
+        )
+
+        assert [skill.name for skill in composite.get_skill_specs()] == [
+            "math_and_units",
+            "dates_and_time",
+            "knowledge_lookup",
+        ]
+
+    def test_composite_rejects_conflicting_shared_skill_groups(self):
+        composite = CompositeToolset(toolsets=[MathToolset(), ConflictingSharedSkillToolset()])
+
+        with pytest.raises(ValueError, match="conflicting descriptions"):
+            composite.get_skill_specs()
+
+    def test_skill_metadata_cannot_reference_unknown_tools(self):
+        with pytest.raises(ValueError, match="unknown tools"):
+            ReActAgent._validate_skill_specs(BrokenSkillToolset(), BrokenSkillToolset().get_skill_specs())
+
+    def test_skill_metadata_must_cover_every_tool(self):
+        with pytest.raises(ValueError, match="does not cover tools"):
+            ReActAgent._validate_skill_specs(PartiallySkilledToolset(), PartiallySkilledToolset().get_skill_specs())
+
+    def test_composite_skill_cannot_claim_a_sibling_tool(self):
+        composite = CompositeToolset(toolsets=[CalculatorToolset(), SiblingClaimingToolset()])
+
+        with pytest.raises(ValueError, match="not owned by its toolset"):
+            composite.get_skill_specs()
+
 
 class TestReActAgentConfig:
     """Tests for ReActAgentConfig."""
@@ -257,6 +462,13 @@ class TestReActAgentConfig:
         assert config.model == "gpt-4"
         assert config.max_iterations == 10  # default
         assert config.toolset is not None
+        assert config.failure_handling == "safe"
+        assert config.tool_disclosure == "all"
+
+    def test_legacy_failure_handling_is_supported(self):
+        config = ReActAgentConfig(model="gpt-4", toolset=CalculatorToolset(), failure_handling="legacy")
+
+        assert config.failure_handling == "legacy"
 
     def test_config_with_all_options(self):
         """Test config with all options set."""
@@ -336,7 +548,11 @@ class TestReActAgent:
         )
 
         # Patch the LLM call
-        with patch.object(agent, "_call_llm_direct", return_value=create_mock_response("The answer is 42.")):
+        with patch.object(
+            agent,
+            "_call_llm_direct",
+            return_value=create_mock_response("The answer is 42."),
+        ):
             agent._on_message(
                 build_message_from_payload(
                     generator,
@@ -482,7 +698,7 @@ class TestReActAgent:
 
         # Second message should be the ReAct system prompt
         assert isinstance(llm_request.messages[1], SystemMessage)
-        assert "ReAct" in llm_request.messages[1].content
+        assert llm_request.messages[1].content == DEFAULT_REACT_SYSTEM_PROMPT
 
         # Last message should be the user query
         assert isinstance(llm_request.messages[-1], UserMessage)
@@ -525,3 +741,802 @@ class TestReActModels:
         assert data["action"] == "search"
         assert data["action_input"] == {"query": "test"}
         assert data["observation"] == "Found results"
+
+
+class TestSafeFailureHandling:
+    @staticmethod
+    def build_agent(
+        toolset: ReActToolset,
+        *,
+        failure_handling="safe",
+        max_iterations=5,
+        tool_disclosure="all",
+        system_prompt=None,
+        skill_activation_followup="auto",
+        skill_activation_observation="standard",
+        skill_disclosure_progression="sticky",
+    ):
+        agent_spec = (
+            AgentBuilder(ReActAgent)
+            .set_id("safe_react_agent")
+            .set_name("Safe ReAct Agent")
+            .set_description("Exercise deterministic ReAct failure handling")
+            .set_properties(
+                ReActAgentConfig(
+                    model="test-model",
+                    toolset=toolset,
+                    failure_handling=failure_handling,
+                    tool_disclosure=tool_disclosure,
+                    skill_activation_followup=skill_activation_followup,
+                    skill_activation_observation=skill_activation_observation,
+                    skill_disclosure_progression=skill_disclosure_progression,
+                    max_iterations=max_iterations,
+                    system_prompt=system_prompt,
+                )
+            )
+            .build_spec()
+        )
+        dependencies = {
+            "llm": DependencySpec(
+                class_name="rustic_ai.litellm.agent_ext.llm.LiteLLMResolver",
+                properties={"model": "test-model"},
+            )
+        }
+        return wrap_agent_for_testing(agent_spec, dependency_map=dependencies)
+
+    @staticmethod
+    def run(agent, responses, generator, build_message_from_payload):
+        with patch.object(agent, "_call_llm_direct", side_effect=responses):
+            agent._on_message(
+                build_message_from_payload(
+                    generator,
+                    ChatCompletionRequest(messages=[UserMessage(content="Use the requested tools.")]),
+                )
+            )
+
+    def test_suppresses_duplicate_execution_and_preserves_verified_result(self, generator, build_message_from_payload):
+        CountingMathToolset.execution_count = 0
+        agent, results = self.build_agent(CountingMathToolset())
+        tool_call = create_tool_call("call_1", "calculate", {"expression": "2+2"})
+        duplicate = create_tool_call("call_2", "calculate", {"expression": "2+2"})
+
+        self.run(
+            agent,
+            [
+                create_mock_response("Calculate.", [tool_call], FinishReason.tool_calls),
+                create_mock_response("Again.", [duplicate], FinishReason.tool_calls),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        fields = response.choices[0].provider_specific_fields
+        trace = fields["react_trace"]
+        assert CountingMathToolset.execution_count == 1
+        assert [step["executed"] for step in trace] == [True, False]
+        assert fields["termination_reason"] == "duplicate_tool_call"
+        assert fields["success"] is True
+        assert "2+2 = 4" in response.choices[0].message.content
+
+    def test_progressively_discloses_selected_skill_tools(self, generator, build_message_from_payload):
+        agent, results = self.build_agent(MathToolset(), tool_disclosure="skills")
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Select math and units.",
+                    [
+                        create_tool_call(
+                            "skill_1",
+                            "activate_tool_skill",
+                            {"skill": "math_and_units"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Calculate.",
+                    [create_tool_call("call_1", "calculate", {"expression": "2+2"})],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response("The result is 4."),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        trace = response.choices[0].provider_specific_fields["react_trace"]
+
+        assert [step["action"] for step in trace] == [
+            "activate_tool_skill",
+            "calculate",
+        ]
+        assert trace[0]["executed"] is False
+        assert json.loads(trace[0]["observation"])["available_tools"] == [
+            "calculate",
+            "convert_units",
+        ]
+        assert response.choices[0].message.content == "The result is 4."
+
+    def test_required_skill_followup_excludes_selector_and_requires_domain_tool(
+        self, generator, build_message_from_payload
+    ):
+        captured_requests = []
+
+        def capture(_llm, request):
+            captured_requests.append(request)
+            if len(captured_requests) == 1:
+                return create_mock_response(
+                    "Activate math and units.",
+                    [
+                        create_tool_call(
+                            "skill_1",
+                            "activate_tool_skill",
+                            {"skill": "math_and_units"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                )
+            if len(captured_requests) == 2:
+                return create_mock_response(
+                    "Calculate.",
+                    [create_tool_call("call_1", "calculate", {"expression": "2+2"})],
+                    FinishReason.tool_calls,
+                )
+            return create_mock_response("The result is 4.")
+
+        agent, _ = self.build_agent(
+            MathToolset(),
+            tool_disclosure="skills",
+            skill_activation_followup="required",
+        )
+        self.run(agent, capture, generator, build_message_from_payload)
+
+        assert [tool.function.name for tool in captured_requests[0].tools] == ["activate_tool_skill"]
+        assert [tool.function.name for tool in captured_requests[1].tools] == [
+            "calculate",
+            "convert_units",
+        ]
+        assert captured_requests[1].tool_choice == "required"
+        assert {tool.function.name for tool in captured_requests[2].tools} == {
+            "activate_tool_skill",
+            "calculate",
+            "convert_units",
+        }
+        assert captured_requests[2].tool_choice is None
+
+    def test_explicit_skill_observation_requires_a_domain_action(self, generator, build_message_from_payload):
+        agent, results = self.build_agent(
+            MathToolset(),
+            tool_disclosure="skills",
+            skill_activation_observation="explicit",
+        )
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Activate math and units.",
+                    [
+                        create_tool_call(
+                            "skill_1",
+                            "activate_tool_skill",
+                            {"skill": "math_and_units"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response("Ready."),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        observation = json.loads(response.choices[0].provider_specific_fields["react_trace"][0]["observation"])
+        assert "did not answer the user" in observation["next_action"]
+
+    def test_can_expand_all_tools_after_first_success(self, generator, build_message_from_payload):
+        captured_requests = []
+
+        def capture(_llm, request):
+            captured_requests.append(request)
+            if len(captured_requests) == 1:
+                return create_mock_response(
+                    "Activate math and units.",
+                    [
+                        create_tool_call(
+                            "skill_1",
+                            "activate_tool_skill",
+                            {"skill": "math_and_units"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                )
+            if len(captured_requests) == 2:
+                return create_mock_response(
+                    "Calculate.",
+                    [create_tool_call("call_1", "calculate", {"expression": "2+2"})],
+                    FinishReason.tool_calls,
+                )
+            return create_mock_response("The result is 4.")
+
+        agent, _ = self.build_agent(
+            MathToolset(),
+            tool_disclosure="skills",
+            skill_disclosure_progression="expand_after_first_success",
+        )
+        self.run(agent, capture, generator, build_message_from_payload)
+
+        assert [tool.function.name for tool in captured_requests[0].tools] == ["activate_tool_skill"]
+        assert {tool.function.name for tool in captured_requests[1].tools} == {
+            "activate_tool_skill",
+            "calculate",
+            "convert_units",
+        }
+        assert {tool.function.name for tool in captured_requests[2].tools} == {
+            "calculate",
+            "convert_units",
+        }
+
+    def test_skill_mode_falls_back_to_all_tools_without_skill_metadata(self, generator, build_message_from_payload):
+        agent, results = self.build_agent(CalculatorToolset(), tool_disclosure="skills")
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Calculate.",
+                    [create_tool_call("call_1", "calculate", {"expression": "2+2"})],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response("The result is 4."),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        trace = response.choices[0].provider_specific_fields["react_trace"]
+        assert [step["action"] for step in trace] == ["calculate"]
+
+    def test_skill_selector_uses_a_singular_dynamic_enum(self):
+        toolset = CompositeToolset(toolsets=[MathToolset(), TemporalToolset()])
+        spec = ReActAgent._skill_selector_spec(toolset.get_skill_specs())
+        schema = spec.chat_tool.function.parameters.model_dump(mode="json")
+
+        assert spec.name == "activate_tool_skill"
+        assert schema["required"] == ["skill"]
+        assert schema["properties"]["skill"]["enum"] == [
+            "math_and_units",
+            "dates_and_time",
+        ]
+        assert "skills" not in schema["properties"]
+        assert "do not predict or activate every skill upfront" in spec.description
+
+    def test_incrementally_activates_a_second_skill_after_using_the_first(self, generator, build_message_from_payload):
+        toolset = CompositeToolset(toolsets=[MathToolset(), TemporalToolset()])
+        agent, results = self.build_agent(toolset, tool_disclosure="skills")
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Activate math and units.",
+                    [
+                        create_tool_call(
+                            "skill_1",
+                            "activate_tool_skill",
+                            {"skill": "math_and_units"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Calculate.",
+                    [create_tool_call("call_1", "calculate", {"expression": "2+2"})],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Now activate dates and time.",
+                    [
+                        create_tool_call(
+                            "skill_2",
+                            "activate_tool_skill",
+                            {"skill": "dates_and_time"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Inspect the date.",
+                    [
+                        create_tool_call(
+                            "call_2",
+                            "get_date_info",
+                            {"date": "2026-08-08"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response("The results are 4 and Saturday."),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        trace = response.choices[0].provider_specific_fields["react_trace"]
+        assert [step["action"] for step in trace] == [
+            "activate_tool_skill",
+            "calculate",
+            "activate_tool_skill",
+            "get_date_info",
+        ]
+        second_activation = json.loads(trace[2]["observation"])
+        assert second_activation["active_skills"] == [
+            "dates_and_time",
+            "math_and_units",
+        ]
+        assert second_activation["available_tools"] == [
+            "calculate",
+            "convert_units",
+            "get_current_time",
+            "convert_datetime",
+            "get_date_info",
+            "add_calendar_period",
+            "add_business_days",
+            "calendar_days_between",
+            "business_days_between",
+        ]
+
+    def test_allows_multiple_singular_activations_in_one_model_response(self, generator, build_message_from_payload):
+        toolset = CompositeToolset(toolsets=[MathToolset(), TemporalToolset()])
+        agent, results = self.build_agent(toolset, tool_disclosure="skills")
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Activate both independently.",
+                    [
+                        create_tool_call(
+                            "skill_1",
+                            "activate_tool_skill",
+                            {"skill": "math_and_units"},
+                        ),
+                        create_tool_call(
+                            "skill_2",
+                            "activate_tool_skill",
+                            {"skill": "dates_and_time"},
+                        ),
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response("The tools are ready."),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        trace = response.choices[0].provider_specific_fields["react_trace"]
+        assert [step["outcome"] for step in trace] == ["success", "success"]
+        assert json.loads(trace[-1]["observation"])["active_skills"] == [
+            "dates_and_time",
+            "math_and_units",
+        ]
+
+    def test_domain_tool_must_be_disclosed_in_a_later_model_round(self, generator, build_message_from_payload):
+        agent, results = self.build_agent(MathToolset(), tool_disclosure="skills")
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Activate and call too early.",
+                    [
+                        create_tool_call(
+                            "skill_1",
+                            "activate_tool_skill",
+                            {"skill": "math_and_units"},
+                        ),
+                        create_tool_call("call_early", "calculate", {"expression": "2+2"}),
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Call after disclosure.",
+                    [create_tool_call("call_1", "calculate", {"expression": "2+2"})],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response("The result is 4."),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        fields = response.choices[0].provider_specific_fields
+        trace = fields["react_trace"]
+        assert trace[1]["error_code"] == "tool_not_disclosed"
+        assert trace[1]["executed"] is False
+        assert trace[1]["model_round"] == 1
+        assert trace[2]["outcome"] == "success"
+        assert trace[2]["model_round"] == 2
+        assert fields["success"] is True
+        assert fields["unresolved_tool_failures"] == []
+
+    def test_custom_prompt_gets_incremental_contract_from_selector(self, generator, build_message_from_payload):
+        captured_requests = []
+
+        def capture(_llm, request):
+            captured_requests.append(request)
+            return create_mock_response("No tool is needed.")
+
+        agent, _ = self.build_agent(
+            MathToolset(),
+            tool_disclosure="skills",
+            system_prompt="Custom replacement prompt.",
+        )
+        self.run(agent, capture, generator, build_message_from_payload)
+
+        request = captured_requests[0]
+        system_messages = [message for message in request.messages if isinstance(message, SystemMessage)]
+        assert system_messages[-1].content == "Custom replacement prompt."
+        assert "Call this selector again later" in request.tools[0].function.description
+
+    def test_skill_activation_uses_global_iteration_budget_not_a_selector_cap(
+        self, generator, build_message_from_payload
+    ):
+        toolset = CompositeToolset(toolsets=[MathToolset(), TemporalToolset(), MediaWikiSearchToolset()])
+        agent, results = self.build_agent(toolset, tool_disclosure="skills", max_iterations=4)
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Math and units.",
+                    [
+                        create_tool_call(
+                            "skill_1",
+                            "activate_tool_skill",
+                            {"skill": "math_and_units"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Dates and time.",
+                    [
+                        create_tool_call(
+                            "skill_2",
+                            "activate_tool_skill",
+                            {"skill": "dates_and_time"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Knowledge lookup.",
+                    [
+                        create_tool_call(
+                            "skill_3",
+                            "activate_tool_skill",
+                            {"skill": "knowledge_lookup"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response("All three are active."),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        fields = response.choices[0].provider_specific_fields
+        assert fields["success"] is True
+        assert fields["termination_reason"] == "completed"
+        assert len(fields["react_trace"]) == 3
+
+    def test_retries_invalid_skill_activation_and_stops_on_same_error_class(
+        self, generator, build_message_from_payload
+    ):
+        toolset = CompositeToolset(toolsets=[MathToolset(), TemporalToolset()])
+        agent, results = self.build_agent(toolset, tool_disclosure="skills")
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Unknown.",
+                    [create_tool_call("skill_1", "activate_tool_skill", {"skill": "mathematics"})],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Still unknown.",
+                    [create_tool_call("skill_2", "activate_tool_skill", {"skill": "math"})],
+                    FinishReason.tool_calls,
+                ),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        fields = response.choices[0].provider_specific_fields
+        assert fields["termination_reason"] == "tool_retry_exhausted"
+        assert [step["error_code"] for step in fields["react_trace"]] == [
+            "unknown_skill",
+            "unknown_skill",
+        ]
+        assert [step["attempt"] for step in fields["react_trace"]] == [1, 2]
+
+    def test_already_active_skill_can_be_corrected_to_another_skill(self, generator, build_message_from_payload):
+        toolset = CompositeToolset(toolsets=[MathToolset(), TemporalToolset()])
+        agent, results = self.build_agent(toolset, tool_disclosure="skills")
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Math and units.",
+                    [
+                        create_tool_call(
+                            "skill_1",
+                            "activate_tool_skill",
+                            {"skill": "math_and_units"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Repeat math and units.",
+                    [
+                        create_tool_call(
+                            "skill_2",
+                            "activate_tool_skill",
+                            {"skill": "math_and_units"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Correct to dates and time.",
+                    [
+                        create_tool_call(
+                            "skill_3",
+                            "activate_tool_skill",
+                            {"skill": "dates_and_time"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response("Both are active."),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        fields = response.choices[0].provider_specific_fields
+        assert fields["react_trace"][1]["error_code"] == "already_active"
+        assert fields["react_trace"][1]["outcome"] == "retryable_error"
+        assert fields["success"] is True
+        assert fields["unresolved_tool_failures"] == []
+
+    def test_allows_one_corrected_argument_attempt(self, generator, build_message_from_payload):
+        agent, results = self.build_agent(MathToolset())
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Wrong shape.",
+                    [create_tool_call("call_1", "calculate", {"value": 4})],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Correct it.",
+                    [create_tool_call("call_2", "calculate", {"expression": "2+2"})],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response("The verified answer is 4."),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        fields = response.choices[0].provider_specific_fields
+        assert response.choices[0].message.content == "The verified answer is 4."
+        assert fields["termination_reason"] == "completed"
+        assert fields["unresolved_tool_failures"] == []
+
+    def test_stops_after_second_error_of_same_class(self, generator, build_message_from_payload):
+        agent, results = self.build_agent(MathToolset())
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Try prose.",
+                    [create_tool_call("call_1", "calculate", {"expression": "15% of 240"})],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Try other prose.",
+                    [create_tool_call("call_2", "calculate", {"expression": "15 percent of 240"})],
+                    FinishReason.tool_calls,
+                ),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        fields = response.choices[0].provider_specific_fields
+        assert fields["termination_reason"] == "tool_retry_exhausted"
+        assert fields["success"] is False
+        assert len(fields["react_trace"]) == 2
+
+    def test_ambiguous_unit_returns_deterministic_clarification(self, generator, build_message_from_payload):
+        agent, results = self.build_agent(MathToolset())
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Convert it.",
+                    [
+                        create_tool_call(
+                            "call_1",
+                            "convert_units",
+                            {"value": 3, "from_unit": "gallon", "to_unit": "l"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                )
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        fields = response.choices[0].provider_specific_fields
+        assert fields["termination_reason"] == "clarification_required"
+        assert "specify US or Imperial" in response.choices[0].message.content
+
+    def test_failed_lookup_replaces_unsupported_memory_answer(self, generator, build_message_from_payload):
+        FixedLookupToolset.outcomes = ["no_result"]
+        FixedLookupToolset.execution_count = 0
+        agent, results = self.build_agent(FixedLookupToolset())
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Look it up.",
+                    [
+                        create_tool_call(
+                            "call_1",
+                            "duckduckgo_instant_answer",
+                            {"query": "capital of France"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response("The capital is Paris."),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        fields = response.choices[0].provider_specific_fields
+        assert fields["termination_reason"] == "unresolved_tool_failure"
+        assert "Paris" not in response.choices[0].message.content
+        assert "could not verify" in response.choices[0].message.content
+
+    def test_corrected_lookup_resolves_previous_no_result(self, generator, build_message_from_payload):
+        FixedLookupToolset.outcomes = ["no_result", "ok"]
+        FixedLookupToolset.execution_count = 0
+        agent, results = self.build_agent(FixedLookupToolset())
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Question query.",
+                    [
+                        create_tool_call(
+                            "call_1",
+                            "duckduckgo_instant_answer",
+                            {"query": "capital of France"},
+                        )
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Topic query.",
+                    [create_tool_call("call_2", "duckduckgo_instant_answer", {"query": "France"})],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response("The verified capital is Paris."),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        fields = response.choices[0].provider_specific_fields
+        assert fields["success"] is True
+        assert fields["unresolved_tool_failures"] == []
+        assert response.choices[0].message.content == "The verified capital is Paris."
+
+    def test_mixed_request_returns_verified_partial_results(self, generator, build_message_from_payload):
+        FixedLookupToolset.outcomes = ["no_result"]
+        FixedLookupToolset.execution_count = 0
+        toolset = CompositeToolset(toolsets=[MathToolset(), FixedLookupToolset()])
+        agent, results = self.build_agent(toolset)
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Complete both parts.",
+                    [
+                        create_tool_call("call_1", "calculate", {"expression": "6*7"}),
+                        create_tool_call(
+                            "call_2",
+                            "duckduckgo_instant_answer",
+                            {"query": "unknown topic"},
+                        ),
+                    ],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response("42, and I think the fact is probably true."),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        content = response.choices[0].message.content
+        assert "6*7 = 42" in content
+        assert "could not verify" in content
+        assert response.choices[0].provider_specific_fields["success"] is False
+
+    def test_legacy_mode_executes_duplicates_and_keeps_model_answer(self, generator, build_message_from_payload):
+        CountingMathToolset.execution_count = 0
+        agent, results = self.build_agent(CountingMathToolset(), failure_handling="legacy")
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Calculate.",
+                    [create_tool_call("call_1", "calculate", {"expression": "2+2"})],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response(
+                    "Repeat.",
+                    [create_tool_call("call_2", "calculate", {"expression": "2+2"})],
+                    FinishReason.tool_calls,
+                ),
+                create_mock_response("The answer is 4."),
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        assert CountingMathToolset.execution_count == 2
+        assert response.choices[0].message.content == "The answer is 4."
+
+    def test_max_iterations_preserves_verified_result(self, generator, build_message_from_payload):
+        agent, results = self.build_agent(MathToolset(), max_iterations=1)
+        self.run(
+            agent,
+            [
+                create_mock_response(
+                    "Calculate.",
+                    [create_tool_call("call_1", "calculate", {"expression": "2+2"})],
+                    FinishReason.tool_calls,
+                )
+            ],
+            generator,
+            build_message_from_payload,
+        )
+
+        response = ChatCompletionResponse.model_validate(results[-1].payload)
+        assert "2+2 = 4" in response.choices[0].message.content
+        assert response.choices[0].provider_specific_fields["termination_reason"] == "max_iterations"

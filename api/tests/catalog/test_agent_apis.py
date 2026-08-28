@@ -196,6 +196,7 @@ def test_register_agent(catalog_client):
                 "dependency_var": None,
                 "guild_level": True,
                 "org_level": False,
+                "required_type": None,
                 "agent_level": False,
                 "variable_name": "filesystem",
             }

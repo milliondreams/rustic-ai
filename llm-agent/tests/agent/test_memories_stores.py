@@ -14,7 +14,15 @@ from rustic_ai.core.guild.agent_ext.depends.dependency_resolver import (
     DependencySpec,
 )
 from rustic_ai.core.guild.agent_ext.depends.llm.models import (
+    ArrayOfContentParts,
     AssistantMessage,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    Choice,
+    FinishReason,
+    SystemMessage,
+    TextContentPart,
+    ToolMessage,
     UserMessage,
 )
 from rustic_ai.core.guild.agent_ext.mixins.state_refresher import StateRefresherMixin
@@ -88,8 +96,9 @@ class FakeLLMMessage:
 
 
 class DummyCtx:
-    def __init__(self, context_dict=None):
+    def __init__(self, context_dict=None, message=None):
         self._context = context_dict or {}
+        self.message = message
 
     def get_context(self):
         return self._context
@@ -303,6 +312,89 @@ def test_history_based_memories_store_recall_includes_non_text_when_disabled(mon
     # text_only=False: keep non-text message, but still dedupe identical text
     contents = [m.content for m in recalled]
     assert contents == ["text A", {"non": "text"}, "text B"]
+
+
+def test_history_based_memories_store_names_current_user_messages(build_message_from_payload, generator):
+    store = HistoryBasedMemoriesStore(text_only=False)
+    request = ChatCompletionRequest(
+        messages=[
+            SystemMessage(content="System guidance"),
+            UserMessage(
+                content=ArrayOfContentParts(root=[TextContentPart(text="Hello")]),
+            ),
+            UserMessage(content="Already named", name="Explicit User"),
+            AssistantMessage(content="Prior assistant"),
+            ToolMessage(content="Tool output", tool_call_id="tool-1"),
+        ]
+    )
+    envelope = build_message_from_payload(generator, request)
+
+    prepared = store.preprocess(None, DummyCtx(message=envelope), request, None)
+
+    assert prepared.messages[0].name is None
+    assert prepared.messages[1].name == "test-agent"
+    assert prepared.messages[1].content == request.messages[1].content
+    assert prepared.messages[2].name == "Explicit User"
+    assert prepared.messages[3].name is None
+    assert not hasattr(prepared.messages[4], "name")
+
+    envelope.sender.name = None
+    fallback_prepared = store.preprocess(None, DummyCtx(message=envelope), request, None)
+    assert fallback_prepared.messages[1].name == "agent-123"
+
+
+def test_history_based_memories_store_names_recalled_senders_and_deduplicates_by_identity(
+    build_message_from_payload, generator
+):
+    store = HistoryBasedMemoriesStore(text_only=True)
+    request = ChatCompletionRequest(
+        messages=[
+            UserMessage(content="Same words"),
+            UserMessage(content="Explicit", name="Original User"),
+        ]
+    )
+    request_envelope = build_message_from_payload(generator, request)
+
+    def response_from(sender_name: str, explicit_name: str | None = None) -> str:
+        response = ChatCompletionResponse(
+            id=f"response-{sender_name}",
+            created=1,
+            model="test-model",
+            choices=[
+                Choice(
+                    finish_reason=FinishReason.stop,
+                    index=0,
+                    message=AssistantMessage(content="Same words", name=explicit_name),
+                )
+            ],
+        )
+        envelope = build_message_from_payload(generator, response)
+        envelope.sender.name = sender_name
+        return envelope.to_json()
+
+    recalled = store.recall(
+        agent=None,
+        ctx=DummyCtx(
+            {
+                "enriched_history": [
+                    request_envelope.to_json(),
+                    response_from("Model 1"),
+                    response_from("Model 2"),
+                    response_from("Model 1"),
+                    response_from("Model 3", "Explicit Assistant"),
+                ]
+            }
+        ),
+        context=[],
+    )
+
+    assert [(message.role, message.name, message.content) for message in recalled] == [
+        ("user", "test-agent", "Same words"),
+        ("user", "Original User", "Explicit"),
+        ("assistant", "Model 1", "Same words"),
+        ("assistant", "Model 2", "Same words"),
+        ("assistant", "Explicit Assistant", "Same words"),
+    ]
 
 
 # ---------------------------------------

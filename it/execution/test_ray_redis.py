@@ -32,7 +32,11 @@ class TestRayRedisIntegration(IntegrationTestABC):
     @pytest.fixture
     def execution_engine(self):
         if not ray.is_initialized():
-            ray.init(include_dashboard=True, runtime_env={"working_dir": str(WORKING_DIR_ROOT)})
+            ray.init(
+                include_dashboard=False,
+                object_store_memory=256 * 1024 * 1024,
+                runtime_env={"working_dir": str(WORKING_DIR_ROOT)},
+            )
         yield "rustic_ai.ray.execution.RayExecutionEngine"
         ray.shutdown()
 

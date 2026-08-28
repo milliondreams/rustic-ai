@@ -37,7 +37,7 @@ class TestResearchWorkflow:
                 goal_id="research-rust-memory",
                 title="Research Rust memory safety mechanisms",
                 description="Deep dive into how Rust ensures memory safety",
-                metrics={"sources_count": 5, "depth": "comprehensive"}
+                metrics={"sources_count": 5, "depth": "comprehensive"},
             )
         )
 
@@ -56,12 +56,7 @@ class TestResearchWorkflow:
 
         for task_id, title in tasks:
             memory_test_harness.send_message(
-                CreateTaskRequest(
-                    goal_id="research-rust-memory",
-                    task_id=task_id,
-                    title=title,
-                    priority=1
-                )
+                CreateTaskRequest(goal_id="research-rust-memory", task_id=task_id, title=title, priority=1)
             )
 
         responses = memory_test_harness.get_sent_messages()
@@ -71,12 +66,7 @@ class TestResearchWorkflow:
             assert response.payload.goal_id == "research-rust-memory"
 
         # Step 3: Start first task
-        memory_test_harness.send_message(
-            UpdateTaskRequest(
-                task_id="task-1",
-                action="start"
-            )
-        )
+        memory_test_harness.send_message(UpdateTaskRequest(task_id="task-1", action="start"))
 
         responses = memory_test_harness.get_sent_messages()
         task_update = responses[0].payload
@@ -96,7 +86,7 @@ class TestResearchWorkflow:
                 ObserveTurnRequest(
                     sender_id="researcher",
                     content=finding,
-                    metadata={"goal_id": "research-rust-memory", "task_id": "task-1"}
+                    metadata={"goal_id": "research-rust-memory", "task_id": "task-1"},
                 )
             )
 
@@ -106,12 +96,7 @@ class TestResearchWorkflow:
             assert isinstance(response.payload, ObserveResult)
 
         # Step 5: Recall research findings
-        memory_test_harness.send_message(
-            RecallRequest(
-                query="How does Rust ensure memory safety?",
-                max_tokens=1000
-            )
-        )
+        memory_test_harness.send_message(RecallRequest(query="How does Rust ensure memory safety?", max_tokens=1000))
 
         responses = memory_test_harness.get_sent_messages()
         recall_response = responses[0].payload
@@ -124,11 +109,7 @@ class TestResearchWorkflow:
 
         # Step 6: Complete task
         memory_test_harness.send_message(
-            UpdateTaskRequest(
-                task_id="task-1",
-                action="complete",
-                outcome="Documented borrow checker mechanisms"
-            )
+            UpdateTaskRequest(task_id="task-1", action="complete", outcome="Documented borrow checker mechanisms")
         )
 
         responses = memory_test_harness.get_sent_messages()
@@ -156,12 +137,7 @@ Rust ensures memory safety through:
 
         # Ingest the document
         memory_test_harness.send_message(
-            IngestDocumentRequest(
-                source_spec={
-                    "path": str(test_doc),
-                    "metadata": {"source": "test", "topic": "rust"}
-                }
-            )
+            IngestDocumentRequest(source_spec={"path": str(test_doc), "metadata": {"source": "test", "topic": "rust"}})
         )
 
         responses = memory_test_harness.get_sent_messages()
@@ -180,12 +156,7 @@ Rust ensures memory safety through:
             {"sender_id": "user", "content": "Finding 3: Lifetimes ensure reference validity"},
         ]
 
-        memory_test_harness.send_message(
-            BatchSubmitRequest(
-                turns=turns,
-                flush_after=True
-            )
-        )
+        memory_test_harness.send_message(BatchSubmitRequest(turns=turns, flush_after=True))
 
         responses = memory_test_harness.get_sent_messages()
         batch_response = responses[0].payload
@@ -206,7 +177,7 @@ class TestGoalTaskManagement:
             CreateGoalRequest(
                 goal_id="parent-research",
                 title="Research Programming Languages",
-                description="Comprehensive study of modern languages"
+                description="Comprehensive study of modern languages",
             )
         )
 
@@ -216,11 +187,7 @@ class TestGoalTaskManagement:
 
         # Create child goal
         memory_test_harness.send_message(
-            CreateGoalRequest(
-                goal_id="child-rust",
-                title="Deep dive into Rust",
-                parent_goal_id="parent-research"
-            )
+            CreateGoalRequest(goal_id="child-rust", title="Deep dive into Rust", parent_goal_id="parent-research")
         )
 
         responses = memory_test_harness.get_sent_messages()
@@ -231,24 +198,14 @@ class TestGoalTaskManagement:
     async def test_goal_lifecycle(self, memory_test_harness):
         """Test complete goal lifecycle: create → start → complete."""
         # Create goal
-        memory_test_harness.send_message(
-            CreateGoalRequest(
-                goal_id="lifecycle-test",
-                title="Test Goal Lifecycle"
-            )
-        )
+        memory_test_harness.send_message(CreateGoalRequest(goal_id="lifecycle-test", title="Test Goal Lifecycle"))
 
         responses = memory_test_harness.get_sent_messages()
         goal = responses[0].payload
         assert isinstance(goal, GoalView)
 
         # Start goal
-        memory_test_harness.send_message(
-            UpdateGoalRequest(
-                goal_id="lifecycle-test",
-                action="start"
-            )
-        )
+        memory_test_harness.send_message(UpdateGoalRequest(goal_id="lifecycle-test", action="start"))
 
         responses = memory_test_harness.get_sent_messages()
         start_response = responses[0].payload
@@ -257,11 +214,7 @@ class TestGoalTaskManagement:
 
         # Complete goal
         memory_test_harness.send_message(
-            UpdateGoalRequest(
-                goal_id="lifecycle-test",
-                action="complete",
-                outcome="Successfully completed test"
-            )
+            UpdateGoalRequest(goal_id="lifecycle-test", action="complete", outcome="Successfully completed test")
         )
 
         responses = memory_test_harness.get_sent_messages()
@@ -273,19 +226,13 @@ class TestGoalTaskManagement:
     async def test_get_goals_by_phase(self, memory_test_harness):
         """Test filtering goals by phase."""
         # Create multiple goals with different statuses
-        memory_test_harness.send_message(
-            CreateGoalRequest(goal_id="goal-1", title="Active Goal 1", status="active")
-        )
-        memory_test_harness.send_message(
-            CreateGoalRequest(goal_id="goal-2", title="Active Goal 2", status="active")
-        )
+        memory_test_harness.send_message(CreateGoalRequest(goal_id="goal-1", title="Active Goal 1", status="active"))
+        memory_test_harness.send_message(CreateGoalRequest(goal_id="goal-2", title="Active Goal 2", status="active"))
 
         memory_test_harness.get_sent_messages()  # Clear
 
         # Get all active goals
-        memory_test_harness.send_message(
-            GetGoalsRequest(phase="active")
-        )
+        memory_test_harness.send_message(GetGoalsRequest(phase="active"))
 
         responses = memory_test_harness.get_sent_messages()
         goals_response = responses[0].payload
@@ -298,28 +245,19 @@ class TestGoalTaskManagement:
     async def test_task_dependencies(self, memory_test_harness):
         """Test creating tasks with dependencies."""
         # Create goal
-        memory_test_harness.send_message(
-            CreateGoalRequest(goal_id="dep-test", title="Test Dependencies")
-        )
+        memory_test_harness.send_message(CreateGoalRequest(goal_id="dep-test", title="Test Dependencies"))
         memory_test_harness.get_sent_messages()
 
         # Create task 1
         memory_test_harness.send_message(
-            CreateTaskRequest(
-                goal_id="dep-test",
-                task_id="task-a",
-                title="Task A (no dependencies)"
-            )
+            CreateTaskRequest(goal_id="dep-test", task_id="task-a", title="Task A (no dependencies)")
         )
         memory_test_harness.get_sent_messages()
 
         # Create task 2 that depends on task 1
         memory_test_harness.send_message(
             CreateTaskRequest(
-                goal_id="dep-test",
-                task_id="task-b",
-                title="Task B (depends on A)",
-                depends_on=["task-a"]
+                goal_id="dep-test", task_id="task-b", title="Task B (depends on A)", depends_on=["task-a"]
             )
         )
 
@@ -338,24 +276,17 @@ class TestMemoryPersistence:
         """Test that observations persist and can be recalled multiple times."""
         # Observe some information
         memory_test_harness.send_message(
-            ObserveTurnRequest(
-                sender_id="user",
-                content="Python is great for data science and machine learning"
-            )
+            ObserveTurnRequest(sender_id="user", content="Python is great for data science and machine learning")
         )
         memory_test_harness.get_sent_messages()
 
         # First recall
-        memory_test_harness.send_message(
-            RecallRequest(query="programming languages for data science")
-        )
+        memory_test_harness.send_message(RecallRequest(query="programming languages for data science"))
         responses1 = memory_test_harness.get_sent_messages()
         recall1 = responses1[0].payload
 
         # Second recall (should return same/similar results)
-        memory_test_harness.send_message(
-            RecallRequest(query="data science languages")
-        )
+        memory_test_harness.send_message(RecallRequest(query="data science languages"))
         responses2 = memory_test_harness.get_sent_messages()
         recall2 = responses2[0].payload
 
@@ -375,31 +306,18 @@ class TestScopeFiltering:
         """Test recall filtered by session."""
         # Observe in session 1
         memory_test_harness.send_message(
-            ObserveTurnRequest(
-                session_id="session-1",
-                sender_id="user",
-                content="Information specific to session 1"
-            )
+            ObserveTurnRequest(session_id="session-1", sender_id="user", content="Information specific to session 1")
         )
         memory_test_harness.get_sent_messages()
 
         # Observe in session 2
         memory_test_harness.send_message(
-            ObserveTurnRequest(
-                session_id="session-2",
-                sender_id="user",
-                content="Information specific to session 2"
-            )
+            ObserveTurnRequest(session_id="session-2", sender_id="user", content="Information specific to session 2")
         )
         memory_test_harness.get_sent_messages()
 
         # Recall scoped to session 1
-        memory_test_harness.send_message(
-            RecallRequest(
-                query="information",
-                scope={"sessions": ["session-1"]}
-            )
-        )
+        memory_test_harness.send_message(RecallRequest(query="information", scope={"sessions": ["session-1"]}))
 
         responses = memory_test_harness.get_sent_messages()
         recall = responses[0].payload

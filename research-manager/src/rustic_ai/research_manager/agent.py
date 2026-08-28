@@ -1,3 +1,5 @@
+"""Research workflow manager agent."""
+
 import textwrap
 from typing import Dict
 

@@ -36,8 +36,8 @@ from rustic_ai.core.utils import GemstoneGenerator
 from rustic_ai.core.utils.basic_class_utils import get_qualified_class_name
 from rustic_ai.core.utils.jexpr import JExpr, JObj, JxScript
 from rustic_ai.playwright.agent import PlaywrightScraperAgent, WebScrapingRequest
+from rustic_ai.research_manager.agent import ResearchManager
 from rustic_ai.serpapi.agent import SERPAgent, SERPResults
-from rustic_ai.showcase.laira.research_manager import ResearchManager
 
 
 class TestResearchGuild:

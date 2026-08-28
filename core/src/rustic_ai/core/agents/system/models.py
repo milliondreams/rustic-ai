@@ -1,6 +1,6 @@
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from rustic_ai.core.guild import AgentSpec
 from rustic_ai.core.guild.dsl import GuildSpec
@@ -29,12 +29,22 @@ class ConflictResponse(BaseModel):
     message: str
 
 
+class DependencySelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    catalog_key: str
+    selector: str
+
+
 class AgentLaunchRequest(BaseModel):
     """
     A class to represent a request to add an agent to the guild.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     agent_spec: AgentSpec
+    dependency_selections: dict[str, DependencySelection] = Field(default_factory=dict)
 
 
 class AgentLaunchResponse(BaseModel):

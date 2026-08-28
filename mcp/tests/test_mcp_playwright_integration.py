@@ -3,6 +3,7 @@ import os
 import shutil
 
 from flaky import flaky
+from playwright.sync_api import sync_playwright
 import pytest
 import shortuuid
 
@@ -49,11 +50,21 @@ class TestMCPPlaywrightIntegration:
 
     @pytest.fixture
     def playwright_agent_spec(self):
+        with sync_playwright() as playwright:
+            chromium_executable = playwright.chromium.executable_path
+
         config = MCPAgentConfig(
             server=MCPServerConfig(
                 type=MCPClientType.STDIO,
                 command="npx",
-                args=["-y", "@playwright/mcp@latest", "--isolated"],
+                args=[
+                    "-y",
+                    "@playwright/mcp@latest",
+                    "--isolated",
+                    "--headless",
+                    "--executable-path",
+                    chromium_executable,
+                ],
             )
         )
 

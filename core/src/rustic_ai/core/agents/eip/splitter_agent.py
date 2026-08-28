@@ -184,7 +184,9 @@ class SplitterAgent(Agent[SplitterConf]):
             items = self.splitter.split(ctx.payload)
             payload_with_format = self.format_selector.get_formats(items)
 
-            self.logger.debug(f"Split into {len(items)} items and generated {len(payload_with_format)} formatted payloads.")
+            self.logger.debug(
+                f"Split into {len(items)} items and generated {len(payload_with_format)} formatted payloads."
+            )
 
             if len(payload_with_format) != len(items):
                 ctx.send_error(

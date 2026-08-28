@@ -313,8 +313,17 @@ class MetaclassHelper:
     def dedup_dependencies_first_wins(deps: List[AgentDependency]) -> List[AgentDependency]:
         seen: Dict[str, AgentDependency] = {}
         for dep in deps:
-            if dep.dependency_key not in seen:
+            existing = seen.get(dep.dependency_key)
+            if existing is None:
                 seen[dep.dependency_key] = dep
+                continue
+            if existing.required_type and dep.required_type and existing.required_type != dep.required_type:
+                raise TypeError(
+                    f"Dependency {dep.dependency_key!r} has conflicting required types: "
+                    f"{existing.required_type!r} and {dep.required_type!r}"
+                )
+            if not existing.required_type and dep.required_type:
+                existing.required_type = dep.required_type
         return list(seen.values())
 
     @staticmethod

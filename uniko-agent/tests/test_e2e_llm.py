@@ -8,32 +8,19 @@ from rustic_ai.uniko_agent.resolver import UnikoResolver
 
 
 @pytest.mark.skipif(
-    not os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") == "",
-    reason="OPENAI_API_KEY not set in environment"
+    not os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") == "", reason="OPENAI_API_KEY not set in environment"
 )
 class TestE2EWithRealAPI:
     """End-to-end tests with real OpenAI API calls."""
 
     def test_resolver_with_real_openai_api(self):
         """Test complete flow: build Uniko, observe, recall, answer with real OpenAI API."""
-        llm_spec = {
-            "alias": "openai",
-            "model_id": "gpt-4o-mini",
-            "key_env": "OPENAI_API_KEY"
-        }
+        llm_spec = {"alias": "openai", "model_id": "gpt-4o-mini", "key_env": "OPENAI_API_KEY"}
 
-        resolver = UnikoResolver(
-            storage_path=None,  # In-memory
-            llm_spec=llm_spec,
-            streaming=False
-        )
+        resolver = UnikoResolver(storage_path=None, llm_spec=llm_spec, streaming=False)  # In-memory
 
         # Resolve to get uniko agent
-        agent = resolver.resolve(
-            org_id="test-org",
-            guild_id="test-guild-e2e",
-            agent_id="test-agent-e2e"
-        )
+        agent = resolver.resolve(org_id="test-org", guild_id="test-guild-e2e", agent_id="test-agent-e2e")
 
         assert agent is not None
         print("\n✓ Successfully created Uniko agent with LLM spec")
@@ -43,9 +30,12 @@ class TestE2EWithRealAPI:
 
         # Create and submit a turn
         import uniko
+
         turn = uniko.Turn("user", "I love Python programming and use it for data science.")
         observe_result = session.observe_sync(turn)
-        print(f"✓ Observed turn: {observe_result.extracted_entities} entities, {observe_result.extracted_observations} observations")
+        print(
+            f"✓ Observed turn: {observe_result.extracted_entities} entities, {observe_result.extracted_observations} observations"
+        )
 
         # Test recall
         recall_result = agent.recall_sync("What programming language does the user like?")
@@ -84,21 +74,13 @@ class TestE2EWithRealAPI:
             "alias": "openai",
             "model_id": "gpt-4o-mini",
             "key_env": "OPENAI_API_KEY",
-            "base_url": "https://api.openai.com/v1"  # Explicit base URL
+            "base_url": "https://api.openai.com/v1",  # Explicit base URL
         }
 
-        resolver = UnikoResolver(
-            storage_path=None,
-            llm_spec=llm_spec,
-            streaming=False
-        )
+        resolver = UnikoResolver(storage_path=None, llm_spec=llm_spec, streaming=False)
 
         # Should build without errors
-        agent = resolver.resolve(
-            org_id="test-org",
-            guild_id="test-guild-baseurl",
-            agent_id="test-agent-baseurl"
-        )
+        agent = resolver.resolve(org_id="test-org", guild_id="test-guild-baseurl", agent_id="test-agent-baseurl")
 
         assert agent is not None
         print("\n✓ Successfully created Uniko agent with custom base_url")

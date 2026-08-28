@@ -4,6 +4,7 @@ import pytest
 from rustic_ai.core.guild.agent import Agent, processor
 from rustic_ai.core.guild.dsl import AgentSpec, BaseAgentProps
 from rustic_ai.core.guild.metaprog.agent_annotations import AgentAnnotations
+from rustic_ai.core.guild.metaprog.agent_metaclass import MetaclassHelper
 from rustic_ai.core.guild.metaprog.agent_registry import AgentDependency, AgentRegistry
 from rustic_ai.core.guild.metaprog.constants import MetaclassConstants
 from rustic_ai.core.utils import JsonDict
@@ -106,6 +107,28 @@ def test_registry_entry_contains_dependencies_and_handlers(agent_cls):
     # Dependencies registered
     dep_keys = {d.dependency_key for d in entry.agent_dependencies}
     assert {"shared_service", "base_only", "sub_only", "ext_attr_dep"}.issubset(dep_keys)
+
+
+def test_processor_infers_canonical_dependency_type():
+    class Service:
+        pass
+
+    @processor(JsonDict, depends_on=["service"])
+    def handle(self, ctx, service: Service):
+        pass
+
+    dep = handle.__annotations__[AgentAnnotations.DEPENDS_ON][0]
+    assert dep.required_type == f"{Service.__module__}.{Service.__qualname__}"
+
+
+def test_conflicting_dependency_types_are_rejected():
+    deps = [
+        AgentDependency(dependency_key="service", required_type="example.ServiceA"),
+        AgentDependency(dependency_key="service", required_type="example.ServiceB"),
+    ]
+
+    with pytest.raises(TypeError, match="conflicting required types"):
+        MetaclassHelper.dedup_dependencies_first_wins(deps)
 
 
 def test_agentspec_accepts_props_type_from_metaclass(agent_cls):

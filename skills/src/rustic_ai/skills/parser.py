@@ -216,7 +216,7 @@ class SkillParser:
             return []
 
         scripts = []
-        for script_file in scripts_dir.iterdir():
+        for script_file in sorted(scripts_dir.iterdir(), key=lambda path: path.name):
             if script_file.is_file() and script_file.suffix in cls.SCRIPT_EXTENSIONS:
                 description = cls._extract_script_description(script_file)
                 scripts.append(
@@ -274,7 +274,7 @@ class SkillParser:
             return []
 
         references = []
-        for ref_file in refs_dir.iterdir():
+        for ref_file in sorted(refs_dir.iterdir(), key=lambda path: path.name):
             if ref_file.is_file():
                 references.append(
                     SkillReference(
@@ -293,7 +293,7 @@ class SkillParser:
             return []
 
         assets = []
-        for asset_file in assets_dir.iterdir():
+        for asset_file in sorted(assets_dir.iterdir(), key=lambda path: path.name):
             if asset_file.is_file():
                 assets.append(
                     SkillAsset(

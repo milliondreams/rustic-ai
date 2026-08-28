@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 from pydantic import BaseModel, Field, model_validator
 
 from rustic_ai.core.guild.agent_ext.depends.llm.tools_manager import ToolSpec
-from rustic_ai.llm_agent.react.toolset import ReActToolset
+from rustic_ai.llm_agent.react.toolset import ReActSkillSpec, ReActToolset
 
 from .executor import ExecutionConfig, ExecutionResult, ScriptExecutor
 from .models import SkillDefinition, SkillScript
@@ -197,6 +197,24 @@ class SkillToolset(ReActToolset):
                     )
                 )
 
+        return specs
+
+    def get_skill_specs(self) -> List[ReActSkillSpec]:
+        """Expose loaded Agent Skills through ReAct progressive disclosure."""
+        specs = []
+        for skill in self.skills:
+            prefix = self._get_tool_prefix(skill)
+            tool_names = [f"{prefix}{script.name}" if prefix else script.name for script in skill.scripts]
+            if not tool_names:
+                continue
+            specs.append(
+                ReActSkillSpec(
+                    name=skill.name,
+                    description=skill.description,
+                    tool_names=tool_names,
+                    instructions=skill.instructions,
+                )
+            )
         return specs
 
     def execute(self, tool_name: str, args: BaseModel) -> str:
